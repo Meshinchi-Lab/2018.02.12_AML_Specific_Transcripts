@@ -1,0 +1,1779 @@
+---
+title: "Genes Highly Expressed in AML"
+author: "Jenny Smith"
+date: "Feb 01, 2022"
+output: html_document
+---
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'/2018.02.12_AML_Specific_Transcripts/'))
+```
+
+```{r}
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE, 
+                      fig.align='center', 
+                      fig.height = 10,
+                      fig.width = 10)
+
+options(stringsAsFactors=FALSE,  java.parameters = "-Xmx4g",
+        bitmapType = 'cairo',device='x11' )
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+
+
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+
+library(tibble)
+library(tidyr)
+library(DeGSEA)
+
+getwd()
+```
+
+# Define Functions
+
+```{r}
+cor.test_function <- function(x,y){
+  cors <- cor.test(x=x, y=y, method="spearman", alternative = "greater")
+  res <- sapply(cors[c("estimate","p.value")], round, digits = 3) %>%
+    paste(.,collapse= "; p=")  
+  
+  return(res)
+}
+```
+
+```{r}
+summarize_expression <- function(TPM_long_fmt, cutoff, direction){
+    
+  required_columns <-  c("gene_name", "TPM")
+  cols_clps <- glue::glue_collapse(required_columns, sep=", ")
+  assertthat::assert_that(all( required_columns %in% colnames(TPM_long_fmt)),
+                            msg=glue::glue("The column names required {cols_clps} are not all present in the expression dataframe `TPM_long_fmt`. Ensure gene symbols have a column gene_name."))
+
+  dir_abbr <- ifelse(direction=="greater", "GT", "LT")
+  
+  if(direction=="greater"){
+    func <- function(x,y){ x > y}
+  }else{
+    func <- function(x,y){ x < y}
+  }
+
+  
+  Num_exp <- paste0(paste0("Number.Expressors_",dir_abbr,"_"),cutoff,"TPM")
+  Perc_expn <- paste0(paste0("Percent.Expressors_",dir_abbr,"_"),cutoff,"TPM")
+  
+  TPM_long_fmt %>%   
+      #Summary Stats
+      group_by(gene_name) %>%
+      summarize(Total_Number_Samples= dplyr::n(),
+              (!!Num_exp) := sum(func(TPM, cutoff)),
+              (!!Perc_expn) := sum(func(TPM, cutoff) /dplyr::n())*100,
+              min_TPM=min(TPM),
+              Mean_TPM=mean(TPM),
+              Q1_TPM=quantile(TPM, probs=0.25),
+              Median_TPM=median(TPM),
+              Q3_TPM=quantile(TPM, probs=0.75),
+              Max_TPM=max(TPM)) %>%
+      ungroup() 
+  
+}
+```
+
+```{r}
+aml_summary_stats <- function(TPM_long_fmt,Columns, aml_cutoff, Q3_expression_min){
+  
+    required_columns <- c("gene_name","Sample")
+  assertthat::assert_that(all( required_columns %in% colnames(TPM_long_fmt)),
+                            msg=glue::glue(c("The column names required: "), glue::glue_collapse(required_columns, sep=", "),
+                                           c(" are not all present in the expression dataframe TPM_long_fmt. Ensure gene symbols have a column `gene_name`, and sample IDs in `Sample` columns are present.")))
+  
+  cols_clps <- glue::glue_collapse(Columns, sep = ", ", last=", and ")
+  assertthat::assert_that(all(Columns %in% colnames(TPM_long_fmt)),
+                            msg=glue::glue("The column names provided {cols_clps} are not all present in the expression dataframe TPM_long_fmt. Ensure all grouping columns are present."))
+  
+
+    #Use map() to apply the summarize_expression() function to each of the grouping variables. 
+    AML.genes <- purrr::map(Columns, function(col){
+      
+      summaries <- TPM_long_fmt %>% 
+        group_by(!!as.symbol(col)) %>% 
+        nest() %>% 
+        mutate(my_summary= purrr::map(data, ~summarize_expression(., cutoff=aml_cutoff, direction = "greater"))) %>% 
+        dplyr::filter(!grepl("Remove", !!as.symbol(col) )) %>%
+        unnest(my_summary) %>% 
+        group_by(gene_name, .add = TRUE) %>% 
+        #minimum expression to be allowed - at least 25% of samples in each fusion group must express the gene at >= XX TPM threshold
+        mutate(Meet_Expression_min=any(Q3_TPM >= Q3_expression_min)) %>% 
+        ungroup() %>% 
+        #Define which subtypes are enriched and list them in a column 
+        group_by(gene_name,Meet_Expression_min) %>% 
+        mutate(Subtypes_Enriched=paste(!!as.symbol(col), collapse = "; ")) %>% 
+        ungroup() %>% 
+        group_by(gene_name) %>% 
+        mutate_at(vars(Subtypes_Enriched), ~case_when(
+            !Meet_Expression_min ~ paste0(unique(Subtypes_Enriched[Meet_Expression_min]), collapse = ""),
+            Meet_Expression_min ~ .)) %>%
+        ungroup()
+      
+      n_groups <- length(unique(summaries[[col]]))
+      if(n_groups > 1){
+        summaries_long <- summaries
+        summaries <- summaries %>%
+              group_by(!!as.symbol(col)) %>% 
+              pivot_wider(id_cols=c(gene_name,Subtypes_Enriched),
+                          names_from=all_of(col),
+                          values_from=c(Total_Number_Samples:Max_TPM,Meet_Expression_min),
+                          names_glue=paste0("{",col,"}_{.value}")) %>%
+              ungroup() %>% 
+              dplyr::select(colnames(.)[order(colnames(.))])
+          
+      }else{
+        summaries <- summaries %>% 
+          dplyr::select(gene_name, everything(), -one_of(c("data", col))) %>% 
+          rename_at(vars(Total_Number_Samples:Max_TPM, Meet_Expression_min), ~paste(col, ., sep="_"))
+      }
+    
+      return(summaries)
+    })  
+    
+    
+    #Combine the individual dataframes from each of the grouping columns
+    AML.genes <- AML.genes %>%
+      purrr::reduce(., .f=left_join, by="gene_name") %>%  
+      #Clean up the Subtypes_Enriched, which was defined per column in the `Column` input. 
+      pivot_longer(cols=matches("Subtypes_Enriched"),
+                  names_to="column", 
+                  values_to="Subtypes_Enriched") %>% 
+      group_by(gene_name) %>% 
+      mutate(Subtypes_Enriched=paste(Subtypes_Enriched[Subtypes_Enriched!=""], collapse = "; ")) %>% 
+      ungroup() %>% 
+      select(gene_name, Subtypes_Enriched, everything(), -column) %>% 
+      distinct() %>% 
+      
+      #Define which genes have any expression > Q3_expression_min 
+      rowwise() %>% 
+      mutate(Number_of_Subtypes_with_Min_Expression=sum(c_across(matches("Meet_Expression_min")))) %>% 
+      ungroup() %>% 
+      arrange(desc(Number_of_Subtypes_with_Min_Expression)) %>% 
+      mutate(Any_Meet_Expression_Min=Number_of_Subtypes_with_Min_Expression >= 1) %>% 
+
+    
+    return(AML.genes)
+}
+```
+
+
+```{r}
+aml_restricted_genes_workflow <- function(cd34pb_cutoff,cd34_percent,
+                                          nbm_cutoff,nbm_percent,
+                                          aml_cutoff, Q3_expression_min,
+                                          Columns,
+                                          TPM_long_fmt, 
+                                          ret_all=FALSE){
+
+  
+  required_columns <- c("gene_name","Sample")
+  assertthat::assert_that(all( required_columns %in% colnames(TPM_long_fmt)),
+                            msg=glue::glue(c("The column names required: "), glue::glue_collapse(required_columns, sep=", "),
+                                           c(" are not all present in the expression dataframe TPM_long_fmt. Ensure gene symbols have a column `gene_name`, and sample IDs in `Sample` columns are present.")))
+  
+  cols_clps <- glue::glue_collapse(Columns, sep = ", ", last=", and ")
+  assertthat::assert_that(all(Columns %in% colnames(TPM_long_fmt)),
+                            msg=glue::glue("The column names provided {cols_clps} are not all present in the expression dataframe TPM_long_fmt. Ensure all grouping columns are present."))
+    
+
+  ## 1. Lowly Expressed Genes in CD34+ Hematopeotic Cells
+  CD34.genes <- TPM_long_fmt %>% 
+    dplyr::filter(grepl("R0.+34POS", Sample)) %>% 
+    group_by(gene_name) %>%
+    dplyr::filter(sum(TPM < cd34pb_cutoff) >= cd34_percent*dplyr::n()) %>%   #XX% of CD34+ have  TPM < threshold
+    ungroup() 
+  
+  CD34.genes <- summarize_expression(TPM_long_fmt = CD34.genes, cutoff=cd34pb_cutoff, direction = "less") %>% 
+    #and ensure the outliers in the remaining XX% are not far outliers. at most 1.5x greater than  cut-off
+    # dplyr::filter(Max_TPM < cd34pb_cutoff*1.5) %>% 
+    rename_at(vars(Total_Number_Samples:Max_TPM), ~paste0("CD34_PB_", .))
+
+  ## 2. Lowly Expressed in bulk NBM
+  NBM.genes <- TPM_long_fmt %>% 
+        dplyr::filter(grepl("BM[0-9]{4}|RO[0-9][0-9]{4}", Sample)) %>% 
+        #only protien coding genes that are also lowly expressing CD34+ NBMs
+        dplyr::filter(gene_name %in% CD34.genes$gene_name) %>% 
+        #Select genes with < threshold TPM in CD34+ NBM and bulk NBM
+        group_by(gene_name) %>%
+        dplyr::filter(sum(TPM < nbm_cutoff) >= nbm_percent*dplyr::n()) %>% #XX% of bulk marrows have TPM < threshold
+        ungroup() 
+    
+  NBM.genes <- summarize_expression(NBM.genes, cutoff=nbm_cutoff, direction = "less") %>% 
+        #and ensure the outliers in the remaining 10% are not SUPER outliers.
+        # filter(Max_TPM < nbm_cutoff*1.5) %>% 
+        rename_at(vars(Total_Number_Samples:Max_TPM), ~paste0("bulk_NBM_", .))
+
+  ## 3. Highly Expressed in AML and Lowly Expressed in NBM  
+    
+    # Select only AML samples
+    AMLGenes <- TPM_long_fmt %>%  
+      #only AML samples
+      dplyr::filter(!grepl("BM[0-9]|R[O0][0-9]",Sample)) %>%  
+      #only protien coding genes that are low in CD34+ and bulk NBM.
+      dplyr::filter(gene_name %in% NBM.genes$gene_name)
+    
+
+    #Create summary statistics for each grouping column provided ( from `Columns` argument)
+    AML.genes <- aml_summary_stats(TPM_long_fmt = AMLGenes, 
+                                   Columns = Columns, 
+                                   aml_cutoff = aml_cutoff, 
+                                   Q3_expression_min = Q3_expression_min)
+ 
+    
+    #Idenfiy genes with at least 1 group (provided from `Columns` argument), meets the expression minimum 
+    AML.genes <- AML.genes %>%  
+
+        #add gene names and add in stats for NBM and CD34+ NBM
+        left_join(., CD34.genes, by="gene_name") %>%
+        left_join(., NBM.genes, by="gene_name") %>%
+        mutate_if(is.numeric, ~round(., digits = 2)) %>%  # for readability
+        dplyr::select(gene_name, 
+                      Subtypes_Enriched,
+                      matches("Number_of_Subtypes_with_Min_Expression|NBM|CD34"),
+               everything())
+    
+    
+    if(ret_all){
+      res <- list("CD34.genes"=CD34.genes,"NBM.genes"=NBM.genes, "AMLGenes"=AML.genes)
+      return(res)
+      
+    }else{
+      return(AML.genes)
+    }
+}
+```
+
+```{r}
+#Plotting function for the summary stats
+summary_stat_plot <- function(summary_stats,subtype, sel_genes=NULL){
+
+  subtype_expn_col <- paste0(subtype,"_Meet_Expression_min")
+  Columns <- c("Subtypes_Enriched", "gene_name","Cell_Surface_Protein",
+               "Normals_Expression_Category", subtype_expn_col)
+
+  assertthat::assert_that(all(Columns %in% colnames(summary_stats)),
+                          msg=glue::glue("Missing required columns {Columns} in the input dataframe."))
+
+
+  #Filter for only those genes that expressed in the selected AML subtype
+  df <- summary_stats %>%
+    filter(grepl(subtype, Subtypes_Enriched),
+           !!as.symbol(subtype_expn_col)) %>% 
+    mutate_at(vars(Cell_Surface_Protein), ~as.factor(ifelse(is.na(.), "Lacks\nEvidence", .))) %>% 
+    mutate_at(vars(Normals_Expression_Category), ~as.factor(.))
+  
+  #tabulate the number of gene targets per subtype selected
+  num_targets_df <- df %>% 
+    group_by(Cell_Surface_Protein, Normals_Expression_Category, .drop=FALSE) %>% 
+    dplyr::count() %>% 
+    ungroup()
+  
+  #make the data into long format
+  df_long <- df %>% 
+    pivot_longer(cols=matches("min_TPM|Q[13]|mean|median|max"),
+                 names_to=c("stat"),
+                 values_to=c("value")) %>% 
+    mutate_at(vars(stat), ~gsub(paste0(subtype,"_"),"", .) %>%
+                factor(., levels=paste0(c("min","Q1","Mean","Median","Q3","Max"),"_TPM")))
+
+  
+  #default genes for now - how to make this dynamic??
+  if(is.null(sel_genes)){
+    sel_genes <- unique(df$gene_name)[1:6]
+  }
+  
+  # #make a barplot with the summary statistics for ~6 genes.
+  # #maybe make this a plotly object?
+  stats <- ggplot(filter(df_long, gene_name %in% sel_genes),
+         aes(x=stat, y=value, fill=stat)) +
+    geom_col(position = position_dodge()) +
+    facet_wrap(~gene_name, scales = "free") +
+    scale_fill_brewer(palette = "Dark2") +
+    labs(x="", y="") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1),
+          strip.text = element_text(size=12),
+          panel.grid.major.x = element_blank(), 
+          legend.position = "top")
+  
+  #Plot the number of targets per selected AML subtpy
+  num_targets <-  ggplot(num_targets_df, aes(x=Cell_Surface_Protein, 
+                                 y=n,
+                                 color=Cell_Surface_Protein,
+                                 fill=Normals_Expression_Category)) +
+    geom_col(position = position_dodge(), color="black") +
+    scale_fill_brewer(palette = "Set1") +
+    labs(y="Number of Gene Targets") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1),
+          strip.text = element_text(size=12),
+          panel.grid.major.x = element_blank(), 
+          legend.position = "top", legend.title = element_blank())
+  
+  
+  # num_targets + stats + patchwork::plot_layout(widths = c(0.5, 1))
+  return(num_targets)
+  
+}
+
+```
+
+```{r}
+ordered_tile_plots <- function(gtex_summary_stats){
+  
+  gtex_mat <- gtex_summary_stats %>% 
+    pivot_wider(id_cols = gene, 
+                names_from=X_primary_site,
+                values_from=tissue_rank) %>% 
+    column_to_rownames("gene") %>% 
+    as.matrix()
+  
+
+  gene_c <- hclust(dist(gtex_mat), method="ward.D2")
+  gene_order <- gene_c$labels[gene_c$order]
+  
+  tissue_c <- hclust(dist(t(gtex_mat)), method="ward.D2")
+  tissue_order <- tissue_c$labels[tissue_c$order]
+  
+  
+  input <- gtex_summary_stats %>% 
+    mutate(gene=factor(gene, levels=gene_order), 
+           X_primary_site=factor(X_primary_site, levels=tissue_order)) %>% 
+    filter(Tissue_Expression_Category != "gene_id not found")
+  
+  tile_plot <- ggplot(input, aes(x=gene, y=X_primary_site, fill=Tissue_Expression_Category)) +
+    geom_tile() +
+    scale_fill_manual(values=c("absent"="floralwhite", "low"="lightskyblue", "high"="orangered")) +
+    theme(legend.position = "top")
+}
+```
+
+
+# Read in the Clinical Data and File Manifest
+
+# Raw Counts
+
+```{r}
+genome <- "GRCh38" #or GRCh37
+```
+
+
+## GRCh38 
+
+
+```{r}
+current_files <- dir(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/"))
+# current_files
+    
+
+if(genome=="GRCh38"){
+    grch38_cts_file <- grep("_RBD_.+scaledTPM_counts.RDS", current_files, value=TRUE)
+    cts_grch38 <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/",grch38_cts_file))
+    cts_grch38_ids <- cts_grch38[,grep("gene_id|gene_name", colnames(cts_grch38))]
+    
+    cts_grch38 <- as.data.frame(cts_grch38)
+    rownames(cts_grch38) <-  cts_grch38_ids$gene_name
+    cts_grch38 <- cts_grch38[,-grep("gene_id|gene_name", colnames(cts_grch38))]
+    
+    # head(cts_grch38[,1:5])
+    dim(cts_grch38) #58263  3021 
+    
+    ### TPM
+    grch38_TPM_file <- grep("Gencode.v29_protein-coding_geneLevel_TPM.txt", dir("Expression_Data/"), value=TRUE)
+    TPM_grch38 <- read.delim(file.path("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM.txt"), 
+                             sep="\t")
+    colnames(TPM_grch38)[grep("PATGIG|PATISD",colnames(TPM_grch38))] <- gsub("_replicate","", grep("PATGIG|PATISD",colnames(TPM_grch38), value=T))
+    # head(TPM_grch38)
+    # dim(TPM_grch38) #58263  1604
+}
+```
+
+## Additional Expression Data
+
+```{r}
+TPM_relapses <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_JMML_APL_DS_MDAnderson_Kallisto_Quant_GeneLevel_dupGenesRemoved_Abundance_TPM.RDS"))
+colnames(TPM_relapses)[grep("PATGIG|PATISD", colnames(TPM_relapses))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(TPM_relapses), value=T))
+
+
+rownames(TPM_relapses) <- TPM_relapses$gene_name
+TPM_relapses <- TPM_relapses[,-c(1:2)]
+
+
+dim(TPM_relapses) #58263  3021
+head(TPM_relapses[,1:5])
+```
+
+```{r eval=FALSE}
+# transcript.TPM.full <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/transcript_level/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_TranscriptLevel_Abundance_TPM.RDS"))
+# colnames(transcript.TPM.full)[grep("PATGIG|PATISD", colnames(transcript.TPM.full))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(transcript.TPM.full), value=T))
+# 
+# 
+# dim(transcript.TPM.full)
+# head(transcript.TPM.full[,1:5])
+```
+
+```{r}
+gtex.TPM.full <- readRDS("Expression_Data/TOIL_TARGET_TGCA_GTEX__rsem_gene_tpm.RDS")
+
+
+# head(gtex.TPM.full[,1:5])
+dim(gtex.TPM.full) #60498 19260
+```
+
+https://www.proteinatlas.org/about/assays+annotation
+
+For both the HPA and GTEx transcriptomics datasets, the average TPM value of all individual samples for each human tissue or human cell type was used to estimate the gene expression level. To be able to combine the datasets into consensus transcript expression levels, a pipeline was set up to normalize the data for all samples. In brief, all TPM values per sample were scaled to a sum of 1 million TPM (denoted pTPM) to compensate for the non-coding transcripts that had been previously removed. Next, all TPM values of all samples within each data source (HPA + GTEx human tissues, HPA immune cell types, HPA cell lines) were normalized separately using Trimmed mean of M values (TMM) to allow for between-sample comparisons. The resulting normalized transcript expression values, denoted nTPM, were calculated for each gene in every sample. nTPM values below 0.1 are not visualized on the Atlas sections.
+
+```{r}
+blood_cell_samples <- readr::read_delim("References/Human_Protein_Atlas/rna_blood_cell_sample.tsv",
+                                        delim="\t", show_col_types = FALSE) %>% 
+  janitor::clean_names()
+
+
+# dim(blood_cell_samples) # 2189810       8
+# head(blood_cell_samples)
+# table(blood_cell_samples$`Immune cell`)
+# length(unique(blood_cell_samples$donor)) #6 unique donots - 109 flow-sorted samples
+
+
+#yep its the average of this dataset
+# blood_cell_samples %>% 
+#   dplyr::filter(immune_cell=="basophil", ensg_id=="ENSG00000000003") %>% 
+#   summarize(across(.cols=tpm:n_tpm, .fns = list(Average=~mean(.)))) %>% 
+#   mutate_all(~round(.,digits=1))
+```
+
+```{r}
+# For both the HPA and GTEx transcriptomics datasets, the average TPM value of all individual samples for each human tissue or human cell type was used to estimate the gene expression level. 
+# blood_cell_rnaseq <- readr::read_delim("References/Human_Protein_Atlas/rna_blood_cell.tsv",
+#                                        delim="\t", show_col_types = FALSE) %>% 
+#   janitor::clean_names()
+
+# dim(blood_cell_rnaseq) #381710      6
+# head(blood_cell_rnaseq)
+
+#Yes checks out
+# blood_cell_rnaseq %>% 
+#   dplyr::filter(blood_cell=="basophil", gene=="ENSG00000000003")
+```
+
+
+# ClinData
+
+```{r message=FALSE}
+#https://cran.r-project.org/web/packages/REDCapR/vignettes/workflow-read.html
+project <- "AML_restricted_Genes_2022"
+
+if(project==""){
+  stop("Must include Projecy name!")
+}else{
+  message(paste0("Project is: ",project))
+  current_cde_database <- paste("TARGET_AML_CDEs_For_Project",project, ".RDS", sep="_")
+
+  if(file.exists(current_cde_database)){
+    print("Reading CDEs from Rdata object.")
+    merged <- readRDS(current_cde_database)
+
+  }else{
+    print("Downloading CDEs from RedCap API.")
+    path_credential <- file.path(HOME,".redcap")
+    project_id <- 1295
+
+    credential  <- REDCapR::retrieve_credential_local(
+      path_credential = path_credential,
+      project_id = project_id)
+
+    #takes about 30 sec to download.
+    merged <- redcap_read(redcap_uri = credential$redcap_uri,
+                          token = credential$token,
+                          raw_or_label_headers = 'label')
+    if(merged$success){
+      merged <- data.frame(merged$data, check.names=TRUE) #remove the white spaces  (will this even work??)
+      saveRDS(merged, current_cde_database)
+    }
+
+    #Create a simple log file from the day the project starts
+    cat(c(paste("Date:", Sys.Date()),
+          paste("cts:", basename(get(ls(pattern = "_cts_file")))),
+          paste("tpm:", basename(get(ls(pattern = "_TPM_file")))),
+          paste("CDE:", current_cde_database)),
+          sep = "\n",
+          file = paste(project, Sys.Date(), ".log", sep="_"))
+
+  }
+
+  #keep a list of the ineligable patiens to remove if necessary
+  inelig <- merged %>%
+    dplyr::filter(Eligibility.Comments == "remove") %>%
+    pull(USI)
+
+  #Filter those with USIs and are eligible for the study
+  merged <- merged %>%
+    dplyr::filter(Eligibility.Comments != "remove")
+
+
+  dim(merged)
+  head(merged)
+
+}
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(sample_info)
+```
+
+```{r}
+rnaseq_fastqs <- read.csv(file.path(TARGET,"SequencingDataMatrix/Fastq_manifests/TARGET_AML_RNAseq_Fastq_File_Manifest_shareable_08.11.21.csv"))
+
+dim(rnaseq_fastqs)
+# head(rnaseq_fastqs)
+# table(rnaseq_fastqs$Group)
+```
+
+```{r}
+CDE.gtex <- read.table(file.path(TOIL,"Clinical/TOIL_Sample_Info/TcgaTargetGTEX_phenotype.txt"), 
+                  stringsAsFactors = FALSE, sep="\t", header=TRUE)
+
+# head(CDE.gtex[,1:5])
+dim(CDE.gtex) #19,131  samples by   7 cols
+```
+
+
+
+# Read in the Annotations 
+
+```{r}
+geneID.map.anno <- read.csv("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_Annotations.csv")
+
+# geneID.map.anno <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt")) %>%  
+#   dplyr::filter(gene_name %in% rownames(TPM_grch38)) %>%
+#   
+#   # Deduplication 
+#   dplyr::filter(!grepl("_PAR_Y", gene_id)) %>% 
+#   group_by(gene_name) %>% 
+#   mutate(Keep=case_when(
+#     dplyr::n() >= 2 & !all(is.na(Ensembl_ProteinID_with_MembraneLocalization)) ~ !is.na(Ensembl_ProteinID_with_MembraneLocalization),
+#     dplyr::n() >= 2 & !all(gene_type=="protein_coding") ~ gene_type=="protein_coding", 
+#     dplyr::n() >= 2 ~  gene_id %in% cts_grch38_ids$gene_id, 
+#     dplyr::n() == 1 ~ TRUE)) %>% 
+#   ungroup() %>%
+#   dplyr::filter(Keep) %>% 
+#   
+#   # examine cell adhesion labels for accuracy 
+#   mutate(misannotation=case_when(
+#     Cell_Adhesion_Gene=="Yes" & Cell_Surface_Protein=="Yes" ~ "OK", #will need to check these as they are primarily HPA antibody staining evidence with 1 ab (weak evidence)
+#     Cell_Adhesion_Gene=="Yes" & grepl("Transcription|Transcription regulation", Uniprot_Keywords) ~ "Yes",
+#     Cell_Adhesion_Gene=="Yes" & grepl("MIR[0-9]|MIRLET[0-9]", gene_name) ~ "Yes",
+#     Cell_Adhesion_Gene=="Yes" & is.na(Cellular.Compartment_Membrane) &
+#       !c(grepl("Cell adhesion|Secreted|Signal|Cell junction", Uniprot_Keywords) |
+#            grepl("Cell Junctions", Additional.location_HumanProteinAtlas)) ~ "ambiguous",
+#     Cell_Adhesion_Gene=="Yes" & !is.na(Cellular.Compartment_Membrane) ~ "OK",
+#     TRUE ~ "OK")) %>%
+#   mutate_at(vars(Cell_Adhesion_Gene), ~case_when(
+#     misannotation == "Yes" ~ "",
+#     misannotation == "ambiguous" ~ "ambiguous",
+#     TRUE ~ .)) %>%
+#   mutate_at(vars(Cell_Surface_Protein), ~case_when(
+#     gene_name=="PRAME" ~ "",
+#     TRUE ~ .)) %>%
+#   dplyr::select(-misannotation)
+
+
+# head(geneID.map.anno[,1:5])
+# dim(geneID.map.anno) #19901    24
+table(geneID.map.anno$gene_type)
+# table(geneID.map.anno$Cell_Adhesion_Gene)
+
+
+# write.csv(geneID.map.anno, "Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_Annotations.csv", row.names = F)
+```
+
+```{r}
+gtex_idmap <- read.csv("Expression_Data/TOIL_TARGET_TCGA_GTEX_probeMap_gencode.v23.annotation.gene.probemap.csv")
+
+head(gtex_idmap)
+```
+
+```{r}
+gene_info <- read.delim(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/Homo_sapiens.gene_info.txt"), 
+                    sep="\t") %>% 
+  janitor::clean_names() 
+
+alias <- gene_info %>%  
+  separate(synonyms, into=paste0("synonym",1:30), sep="\\|", 
+           remove=TRUE, extra="merge", fill="right") %>% 
+  pivot_longer(cols=matches("synonym"),
+               names_to="synonym_per_gene", 
+               values_to="synonyms") %>% 
+  dplyr::select(x_tax_id,symbol,
+                symbol_from_nomenclature_authority,
+                gene_id,synonyms) %>% 
+  dplyr::filter(!is.na(synonyms))
+
+# head(alias)
+```
+
+# Define Samples 
+
+```{r}
+samples_to_select <- read.csv("Expression_Data/TARGET_AML_Input_Samples_for_AMLRestrictedGenes_Analysis_6.22.21.csv") %>%
+  mutate(USI1=str_split_fixed(Sample, pattern="\\.", n=4)[,3]) %>% 
+  dplyr::filter(!USI1 %in% inelig) %>% 
+  dplyr::filter(!grepl("replicate", Sample)) %>% 
+  
+  #For fusion groups 
+  group_by(Primary.Fusion) %>% 
+  mutate(AML_Subtype_Detailed=case_when(
+    dplyr::n() >= 10 ~ gsub("None$","No.Fusion", Primary.Fusion),
+    dplyr::n() < 10 & grepl("KMT2A", Primary.Fusion) ~ "KMT2A-other",
+    grepl("NBM|CD34", Group) ~ Group,
+    TRUE ~ "AML.NOS")) %>%
+  ungroup()  %>% 
+  mutate(AMLvsNormals=ifelse(grepl("CD34_PB|NBM", Group), "Normal", "AML"), 
+         AML=ifelse(Group=="AML", "AML",  "Remove")) %>% 
+  
+  #For fusion groups with multiple partners
+  #NOTE its critical that the columnname be identical to the classification name, eg KMT2A_Fusion column contains "KMT2A_Fusion" as class label for the positive patients. 
+  mutate(KMT2A_Fusion=case_when(
+          grepl("KMT2A",Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV) ~ "KMT2A_Fusion", 
+          grepl("NBM|CD34", Group) ~ Group,
+          TRUE ~ "Remove"), 
+        ETS_Fusion=case_when(
+           grepl("ETS|ETV6|FUS_ERG", ETS_Fusion) ~ "ETS_Fusion",
+           grepl("NBM|CD34", Group) ~ Group,
+           TRUE ~ "Remove"),
+        NUP98_Fusion=case_when(
+          grepl("NUP98",Primary.Fusion) | grepl("NUP98", Additional.Fusions.CNV) ~ "NUP98_Fusion", 
+          grepl("NBM|CD34", Group) ~ Group,
+          TRUE ~ "Remove")) %>% 
+  left_join(., select(merged, USI, Cyto.Fusion.Molecular.Risk), 
+            by=c("USI1"="USI")) %>% 
+  mutate_at(vars(Cyto.Fusion.Molecular.Risk), ~case_when(
+    is.na(.) ~ Group,
+    TRUE ~ paste0(.,"_risk"))) %>% 
+  as.data.frame() %>% 
+  mutate(USI=Sample) %>% 
+  set_rownames(.$Sample)
+
+
+dim(samples_to_select)
+table(samples_to_select$Group)
+table(samples_to_select$Cyto.Fusion.Molecular.Risk)
+# table(samples_to_select$AML_Subtype_Detailed)
+length(table(samples_to_select$AML_Subtype_Detailed)) #20 AML groups
+# table(samples_to_select$USI1 %in% inelig) #OK
+
+# write.csv(samples_to_select, "Expression_Data/TARGET_AML_Input_Samples_for_AMLRestrictedGenes_Analysis_withFusionGroupsDefined_6.22.21.csv")
+```
+
+Error: package or namespace load failed for 'dplyr' in loadNamespace(i, c(lib.loc, .libPaths()), versionCheck = vI[[i]]):
+ namespace 'ellipsis' 0.3.1 is already loaded, but >= 0.3.2 is required
+ 
+ 1) detach("package:devtools", unload=T)
+ 2) library (ellipsis) #newer v0.3.2
+ 3) library(dplyr)
+ 
+ 
+```{r}
+relapse_samples <- sample_info %>% 
+  
+  filter(grepl("^AML$", Group),
+         grepl("relapse", Time_point)) %>% 
+  filter(!grepl("_replicate|S.1327", Sample)) %>% 
+  #For fusion groups 
+  group_by(Primary.Fusion) %>% 
+  mutate(AML_Subtype_Detailed=case_when(
+    n() >= 3 & Primary.Fusion %in% samples_to_select$AML_Subtype_Detailed ~ Primary.Fusion,
+    grepl("NBM|CD34", Group) ~ Group,
+    TRUE ~ "AML.NOS")) %>%
+  ungroup()  %>% 
+  mutate(AMLvsNormals=ifelse(grepl("CD34_PB|NBM", Group), "Normal", "AML"), 
+         AML=ifelse(Group=="AML", "AML_relapse",  "Remove")) %>% 
+  
+  #For fusion groups with multiple partners
+  #NOTE its critical that the columnname be identical to the classification name, eg KMT2A_Fusion column contains "KMT2A_Fusion" as class label for the positive patients. 
+  mutate(KMT2A_Fusion=case_when(
+          grepl("KMT2A",Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV) ~ "KMT2A_Fusion", 
+          grepl("NBM|CD34", Group) ~ Group,
+          TRUE ~ "Remove"), 
+        ETS_Fusion=case_when(
+           grepl("ETS|ETV6|FUS_ERG", ETS_Fusion) ~ "ETS_Fusion",
+           grepl("NBM|CD34", Group) ~ Group,
+           TRUE ~ "Remove"),
+        NUP98_Fusion=case_when(
+          grepl("NUP98",Primary.Fusion) | grepl("NUP98", Additional.Fusions.CNV) ~ "NUP98_Fusion", 
+          grepl("NBM|CD34", Group) ~ Group,
+          TRUE ~ "Remove")) %>%
+   left_join(., select(merged, USI, Cyto.Fusion.Molecular.Risk), 
+            by=c("USI"="USI")) %>% 
+  mutate_at(vars(Cyto.Fusion.Molecular.Risk), ~case_when(
+    is.na(.) ~ "Remove",
+    TRUE ~ paste0(.,"_risk"))) %>% 
+  as.data.frame() %>%
+  mutate(USI1=USI,
+         USI=Sample) %>%
+  set_rownames(.$Sample)
+
+
+dim(relapse_samples)
+# table(relapse_samples$Time_point)
+# table(relapse_samples$Group)
+# table(relapse_samples$AML)
+# table(relapse_samples$AML_Subtype_Detailed)
+table(relapse_samples$Cyto.Fusion.Molecular.Risk)
+# table(relapse_samples$KMT2A_Fusion)
+# table(relapse_samples$ETS_Fusion)
+# table(relapse_samples$NUP98_Fusion)
+
+# table(relapse_samples$Sample %in% colnames(TPM_relapses))
+# write.csv(relapse_samples, "Expression_Data/TARGET_AML_Relapse_Samples_for_AMLRestrictedGenes_Analysis_withFusionGroupsDefined_02.28.2022.csv")
+```
+
+```{r}
+remission_samples <- sample_info %>% 
+  filter(grepl("^AML$", Group),
+         grepl("remission", Time_point)) %>% 
+  filter(!grepl("_replicate|S.1327", Sample)) %>%
+  filter(Sample %in% colnames(TPM_relapses))  %>%
+    #For fusion groups 
+  group_by(Primary.Fusion) %>% 
+  mutate(AML_Subtype_Detailed=case_when(
+    n() >= 3 & Primary.Fusion %in% samples_to_select$AML_Subtype_Detailed ~ Primary.Fusion,
+    grepl("NBM|CD34", Group) ~ Group,
+    TRUE ~ "AML.NOS")) %>%
+  ungroup()  %>% 
+  mutate(AMLvsNormals=ifelse(grepl("CD34_PB|NBM", Group), "Normal", "AML"), 
+         AML=ifelse(Group=="AML", "AML_remission",  "Remove")) %>% 
+  
+  #For fusion groups with multiple partners
+  #NOTE its critical that the columnname be identical to the classification name, eg KMT2A_Fusion column contains "KMT2A_Fusion" as class label for the positive patients. 
+  mutate(KMT2A_Fusion=case_when(
+          grepl("KMT2A",Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV) ~ "KMT2A_Fusion", 
+          grepl("NBM|CD34", Group) ~ Group,
+          TRUE ~ "Remove"), 
+        ETS_Fusion=case_when(
+           grepl("ETS|ETV6|FUS_ERG", ETS_Fusion) ~ "ETS_Fusion",
+           grepl("NBM|CD34", Group) ~ Group,
+           TRUE ~ "Remove"),
+        NUP98_Fusion=case_when(
+          grepl("NUP98",Primary.Fusion) | grepl("NUP98", Additional.Fusions.CNV) ~ "NUP98_Fusion", 
+          grepl("NBM|CD34", Group) ~ Group,
+          TRUE ~ "Remove")) %>%
+  left_join(., select(merged, USI, Cyto.Fusion.Molecular.Risk), 
+            by=c("USI"="USI")) %>% 
+  mutate_at(vars(Cyto.Fusion.Molecular.Risk), ~case_when(
+    is.na(.) ~ "Remove",
+    TRUE ~ paste0(.,"_risk"))) %>% 
+  as.data.frame() %>%
+  mutate(USI1=USI,
+         USI=Sample) %>%
+  set_rownames(.$Sample)
+
+
+
+dim(remission_samples)
+table(remission_samples$KMT2A_Fusion)
+table(remission_samples$AML_Subtype_Detailed)
+table(remission_samples$Cyto.Fusion.Molecular.Risk)
+# table(remission_samples$AML)
+# write.csv(remission_samples, "Expression_Data/TARGET_AML_Remission_Samples_for_AMLRestrictedGenes_Analysis_withFusionGroupsDefined_02.28.2022.csv")
+```
+
+
+### GTEX Sample Manifests
+
+```{r}
+blood_gtex <- CDE.gtex %>% 
+  dplyr::filter(grepl("Blood", detailed_category)) 
+  # dplyr::filter(sample %in% colnames(gtex.TPM.full)) #All samples accounted for
+
+# blood_gtex
+```
+
+
+```{r}
+gtex_normal_tissues <- CDE.gtex %>% 
+  filter(X_study=="GTEX") %>% 
+  filter(!grepl("^Cells", primary.disease.or.tissue)) %>% 
+  filter(!grepl("Blood|Uterus|Vagina|Cervix|^$|Fallopian|Breast", X_primary_site)) #23 unique tissues
+
+
+dim(gtex_normal_tissues)
+# write.csv(gtex_normal_tissues, "Expression_Data/TOIL_GTEX_normal_tissue_samples_included_gencode.v23.annotation_02.28.2022.csv", row.names=FALSE)
+```
+
+
+
+# Subset Counts 
+
+```{r}
+samps <- intersect(colnames(TPM_grch38), samples_to_select$Sample) #missing Stella
+gene.RBD <- TPM_grch38[,samps]
+
+
+head(gene.RBD[,1:5])
+# dim(gene.RBD) #58263
+```
+
+
+# Gather TPM values into Long Format
+
+```{r}
+# Gather TPM values into Long Format
+TPM.long <- readRDS("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+
+
+# TPM.long <- gene.RBD %>%
+#   as.data.frame() %>%
+#   rownames_to_column("gene_name") %>%
+#   gather(Sample, TPM, -gene_name,) %>%
+#   left_join(., samples_to_select, by="Sample")
+
+# head(TPM.long)
+dim(TPM.long)
+
+# any(is.na(TPM.long$gene_name))
+# saveRDS(TPM.long, "Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+```
+
+
+
+# AML Restricted Genes 
+
+```{r}
+GOI <- c("FOLR1","CLECL1", "SCUBE1","LTK", "LAMP5", "MSLN", "CLEC2A", "COL23A1", "CD70", "SPAG6", "CRLF2", "CSPG4", "CEACAM6")
+goi.regex <- paste(GOI, collapse = "|")
+```
+
+
+NOTE: this aml_restricted_genes_workflow needs to become a TARGETS R package workflow! wasting time re-running the normals expression stuff. 
+
+```{r}
+Columns <- c("AML","Cyto.Fusion.Molecular.Risk","KMT2A_Fusion","ETS_Fusion","NUP98_Fusion","AML_Subtype_Detailed")
+  
+AML_restricted <- readRDS("Results/Non_hematopoietic_genes_approach/TARGET_AML_non-hematpc_genes_lists_Norm.LT.4TPM_AML.GT.1TPM_Q3.GT.4TPM_02.28.2022.RDS")
+
+# AML_restricted <- aml_restricted_genes_workflow(cd34pb_cutoff = 4.0, cd34_percent = 0.75,
+#                                                 nbm_cutoff = 4.0, nbm_percent = 0.75,
+#                                                 aml_cutoff = 1.0, Q3_expression_min = 4.0,
+#                                                 TPM_long_fmt = TPM.long,
+#                                                 Columns=Columns,
+#                                                 ret_all = TRUE)
+
+# #Clean up the AML fusion column names
+# colnames(AML_restricted$AMLGenes) <- colnames(AML_restricted$AMLGenes) %>% gsub("-", "\\.", .)
+# saveRDS(AML_restricted, "Results/Non_hematopoietic_genes_approach/TARGET_AML_non-hematpc_genes_lists_Norm.LT.4TPM_AML.GT.1TPM_Q3.GT.4TPM_02.28.2022.RDS")
+```
+
+```{r}
+names(AML_restricted)
+dim(AML_restricted$CD34.genes) #9713   genes
+dim(AML_restricted$NBM.genes) #8,636  genes
+dim(AML_restricted$AMLGenes) #8636  262
+
+table(AML_restricted$AMLGenes$Any_Meet_Expression_Min) #1,166 genes! 
+# table(TPM.long$NUP98_Fusion)
+# head(AML_restricted$AMLGenes$Subtypes_Enriched)
+table(GOI %in% AML_restricted$NBM.genes$gene_name)
+
+# table(AML_restricted$AMLGenes$High_risk_Meet_Expression_min)
+# table(AML_restricted$AMLGenes$Standard_risk_Meet_Expression_min)
+```
+
+## Relapse Samples 
+
+```{r}
+gene.relapses.long <-  readRDS("Expression_Data/TARGET_AML_relapses_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+
+# gene.relapses.long <- TPM_relapses[AML_restricted$NBM.genes$gene_name, relapse_samples$Sample] %>% 
+#   rownames_to_column("gene_name") %>%
+#   gather(Sample, TPM, -gene_name) %>%
+#   left_join(., relapse_samples, by="Sample")
+
+# saveRDS(gene.relapses.long, "Expression_Data/TARGET_AML_relapses_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+```
+
+```{r}
+Columns <- c("AML","Cyto.Fusion.Molecular.Risk","KMT2A_Fusion","ETS_Fusion","NUP98_Fusion","AML_Subtype_Detailed")
+relapse_samples_expn <- aml_summary_stats(TPM_long_fmt = gene.relapses.long,
+                                          Columns = Columns, 
+                                          aml_cutoff = 1.0, 
+                                          Q3_expression_min = 4.0)
+
+relapse_samples_expn <- relapse_samples_expn %>% 
+  select(1:2,Any_Meet_Expression_Min, everything())
+
+head(relapse_samples_expn)
+dim(relapse_samples_expn)
+table(relapse_samples_expn$Any_Meet_Expression_Min) #1256 meet the expression minimum for any of the non-hemap
+# table(relapse_samples_expn$High_risk_Meet_Expression_min)
+
+# write.csv(filter(relapse_samples_expn, Any_Meet_Expression_Min),
+#           "Results/Non_hematopoietic_genes_approach/TARGET_AML_non-hematopoietic_genes_expressed_in_Relapsed_AML_Subset.csv", row.names = FALSE)
+```
+
+## Remission Samples
+
+```{r}
+gene.remission.long <-  readRDS("Expression_Data/TARGET_AML_remission_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+
+# gene.remission.long <- TPM_relapses[AML_restricted$NBM.genes$gene_name, remission_samples$Sample] %>% 
+#   rownames_to_column("gene_name") %>%
+#   gather(Sample, TPM, -gene_name) %>%
+#   left_join(., remission_samples, by="Sample")
+# 
+# saveRDS(gene.remission.long, "Expression_Data/TARGET_AML_remission_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+
+
+
+# table(remission_samples$Sample %in% colnames(TPM_relapses)) #Shoot! I am missing 8 files :/ I'll need to run AWS Batch workflow to quantify the BAM files with Kallisto
+```
+
+```{r}
+Columns <- c("AML","Cyto.Fusion.Molecular.Risk","KMT2A_Fusion","ETS_Fusion","NUP98_Fusion","AML_Subtype_Detailed")
+remission_samples_expn <- aml_summary_stats(TPM_long_fmt = gene.remission.long,
+                                          Columns = Columns, 
+                                          aml_cutoff = 1.0, 
+                                          Q3_expression_min = 4.0)
+
+remission_samples_expn <- remission_samples_expn %>% 
+  select(1:2,Any_Meet_Expression_Min, everything())
+
+# head(remission_samples_expn)
+# dim(remission_samples_expn)
+table(remission_samples_expn$Any_Meet_Expression_Min) #673 genes 
+# table(remission_samples_expn$High_risk_Meet_Expression_min) #123 genes
+
+# write.csv(filter(remission_samples_expn, Any_Meet_Expression_Min),
+#           "Results/Non_hematopoietic_genes_approach/TARGET_AML_non-hematopoietic_genes_expressed_in_Remission_AML_Subset.csv", row.names = FALSE)
+```
+
+
+
+# Confirm Low Expressed Genes in Other Sources 
+
+```{r}
+ensembl_update <- read.delim("TARGET_AML_non-hematopoeitic_genes_ensemblv105_mart_export.txt", sep="\t")
+
+# head(ensembl_update)
+# length(unique(ensembl_update$Gene.stable.ID)) # 8587
+
+non.hematopoeitic.ids <- geneID.map.anno %>% 
+  dplyr::filter(gene_name %in% AML_restricted$NBM.genes$gene_name) %>% 
+  left_join(., dplyr::select(ensembl_update, Ensembl_v105_Gene.stable.ID=Gene.stable.ID, 
+                             Ensembl_v105_Gene.name=Gene.name) %>% 
+              mutate(gene_id=Ensembl_v105_Gene.stable.ID) %>% 
+              distinct(), 
+            by=c("gene_id"="gene_id")) %>% 
+  dplyr::select(gene_name, gene_id,
+                matches("Ensembl_v105"), everything())
+
+
+
+# dim(non.hematopoeitic.ids) #8636   24
+# head(non.hematopoeitic.ids)
+# table(unique(ensembl_update$Gene.stable.ID) %in% non.hematopoeitic.ids$gene_id)
+# table( non.hematopoeitic.ids$gene_id %in% unique(ensembl_update$Gene.stable.ID)) #missing 49
+
+
+to_update <- dplyr::filter(non.hematopoeitic.ids,
+              is.na(Ensembl_v105_Gene.stable.ID)) %>%
+  dplyr::select(gene_name, gene_id)
+
+# write.table(pull(to_update, gene_id), "Ids_to_update.txt", sep="\t", row.names = F, col.names = F, quote=F)
+matches <- read.table("ids_to_update_mart_export_v1.txt", sep="\t", header = T) %>% 
+  janitor::clean_names()
+
+# dim(matches)
+matches_join <- matches %>% 
+  filter(gene_name %in% to_update$gene_name) %>% 
+  dplyr::select(gene_stable_id, gene_name) %>% 
+  distinct()  %>% 
+  arrange(gene_name) %>% 
+  filter(!duplicated(gene_name))
+
+# matches_join
+
+non.hematopoeitic.ids <- non.hematopoeitic.ids %>% 
+  left_join(., matches_join, by=c("gene_name")) %>% 
+  dplyr::select(1:5, gene_stable_id, everything()) %>% 
+  mutate_at(vars(Ensembl_v105_Gene.stable.ID), ~ifelse(is.na(.), gene_stable_id, .)) %>% 
+  mutate_at(vars(Ensembl_v105_Gene.name), ~ifelse(is.na(.), gene_name, .)) %>% 
+  dplyr::select(-gene_stable_id)
+
+dim(non.hematopoeitic.ids)
+# write.table(non.hematopoeitic.ids, "TARGET_AML_non-hematopoeitic_genes_gencodev29_ensembl_ids.txt", sep="\t", row.names = FALSE)
+```
+
+
+## GTEX 
+
+```{r}
+# BiocManager::install("BRGenomics", lib="~/R/x86_64-pc-linux-gnu-library/4.0/") 
+# suppressPackageStartupMessages(library(plyranges))
+```
+
+```{r}
+non.hematopoeitic.gtex <- non.hematopoeitic.ids %>% 
+  left_join(., dplyr::select(gtex_idmap,ensembl_ID, gene), 
+            by=c("gene_id"="ensembl_ID")) %>% 
+  dplyr::select(gene_name, gene_id,matches("gene"),matches("ensembl_ID"),
+         everything()) 
+
+missing <- non.hematopoeitic.gtex %>% 
+  dplyr::filter(is.na(gene)) %>% 
+  dplyr::filter(gene_name!="C2orf81") %>% #already matched by ensembl ID (AC005041.1 and C2orf81)
+  left_join(.,dplyr::select(gtex_idmap,ensembl_ID, gene),
+            by=c("gene_name"="gene"))
+
+found <- missing %>% 
+  dplyr::filter(!is.na(ensembl_ID))
+
+non.hematopoeitic.gtex <- bind_rows(dplyr::filter(non.hematopoeitic.gtex, !is.na(gene)), found) %>% 
+  mutate_at(vars(ensembl_ID), ~ifelse(is.na(.), gene_id, .)) %>% 
+  mutate_at(vars(gene), ~ifelse(is.na(.), gene_name, .)) %>% 
+  dplyr::select(gene_name, gene_id, gene, ensembl_ID, everything()) 
+
+
+missing <- missing %>% 
+  dplyr::filter(is.na(ensembl_ID))
+
+# table(missing$gene_id %in% gtex_idmap$UpdateENSG)
+# table(missing$gene_name %in% gtex_idmap$gene) #the only way to update these are to interect the GRanges object with the TxDB 
+dim(missing) #202 missing
+dim(non.hematopoeitic.gtex) #8433   26
+
+# table(missing$gene_name %in% AML_restricted$AMLGenes$gene_name) #6 have reasonable expression and perhaps shoud be rescued
+```
+
+```{r eval=FALSE}
+gtex_blood_long <- 2^gtex.TPM.full[non.hematopoeitic.gtex$ensembl_ID, blood_gtex$sample] %>% 
+  rownames_to_column("ensembl_ID") %>% 
+  pivot_longer(cols=matches("GTEX"), 
+               names_to="sample", 
+               values_to="TPM") %>% 
+  left_join(., blood_gtex, by="sample") %>%
+  left_join(., non.hematopoeitic.gtex, by=c("ensembl_ID"))
+
+
+# head(gtex_blood_long)
+# length(unique(gtex_blood_long$ensembl_ID))
+
+gtex_blood_stats <- summarize_expression(gtex_blood_long,
+                                              cutoff=4.0,
+                                              direction = "less") %>%
+    rename_at(vars(Total_Number_Samples:Max_TPM), ~paste0(., "_GTEX_blood")) %>%
+    mutate_if(is.numeric, ~round(., digits = 2))
+
+
+head(gtex_blood_stats)
+dim(gtex_blood_stats)
+# quantile(gtex_blood_stats$gtex_blood_Percent.Expressors_LT_4TPM)
+```
+
+```{r}
+gtex_blood_stats_clean <-  read.csv("Results/Non_hematopoietic_genes_approach/GTEX_whole_blood_Non-hematopeitic_Genes.csv")
+
+# gtex_blood_stats_clean <- gtex_blood_stats %>% 
+#   left_join(., dplyr::select(non.hematopoeitic.gtex, gene_name, GTEX_gene_id=ensembl_ID), 
+#             by="gene_name") %>% 
+#   bind_rows(., dplyr::select(missing, gene_name, GTEX_gene_id=ensembl_ID)) %>% 
+#   dplyr::mutate(GTEX_blood_Expression_Category=case_when(
+#     is.na(Max_TPM_GTEX_blood) ~ "gene_id not found",
+#     Max_TPM_GTEX_blood < 1.0 & Percent.Expressors_LT_4TPM_GTEX_blood >= 75.0 ~ "absent_in_GTEX_blood",  
+#     Max_TPM_GTEX_blood >= 1.0 & Percent.Expressors_LT_4TPM_GTEX_blood >= 75.0 ~ "low_in_GTEX_blood", 
+#     Max_TPM_GTEX_blood > 1.0 & Percent.Expressors_LT_4TPM_GTEX_blood < 75.0 ~ "high_in_GTEX_blood")) %>% 
+#   dplyr::select(gene_name, GTEX_gene_id, 
+#                 GTEX_blood_Expression_Category, 
+#                 everything()) 
+# 
+
+# head(gtex_blood_stats_clean)
+# tail(gtex_blood_stats_clean)
+dim(gtex_blood_stats_clean)
+# quantile(gtex_blood_stats_clean$Percent.Expressors_LT_4TPM_GTEX_blood, na.rm=T)
+table(gtex_blood_stats_clean$GTEX_blood_Expression_Category, useNA = "always")
+
+
+# write.csv(gtex_blood_stats_clean, "Results/GTEX_whole_blood_Non-hematopeitic_Genes.csv")
+```
+
+```{r}
+filter(gtex_blood_stats_clean,GTEX_blood_Expression_Category =="gene_id not found")
+```
+
+### Visualize Expression
+
+```{r}
+# hist <- ggplot(gtex_blood_long, 
+#                aes(x=log2(TPM+1), fill=detailed_category)) +
+#   geom_histogram(binwidth = 0.1) +
+#   # scale_y_continuous(trans='log2') +
+#   scale_fill_manual(values="navy") +
+#   theme_classic()
+# 
+# # ggsave(filename = "Figures/GTEX_whole_blood_non-hematpc_TPM_hist.pdf", plot = hist, height = 5, width = 7, device = "pdf")
+# 
+# df <- dplyr::filter(gtex_blood_long, !gene_name %in% high_expression)
+# 
+# boxp <- ggplot(df, 
+#                aes(y=log2(TPM+1),x=detailed_category, fill=detailed_category)) +
+#   geom_point(aes(color=detailed_category), position = position_jitterdodge(),
+#              size=0.5, alpha=0.5) +
+#   geom_violin(draw_quantiles=0.5, scale="width") +
+#   scale_fill_manual(values="azure1") +
+#   scale_color_manual(values="azure3") +
+#   theme_classic()
+  
+
+# boxp
+```
+
+
+## Human Protein Atlas 
+
+RNA consensus tissue gene data
+Consensus transcript expression levels summarized per gene in 55 tissues based on transcriptomics data from HPA and GTEx. The consensus normalized expression ("nTPM") value is calculated as the maximum nTPM value for each gene in the two data sources. For tissues with multiple sub-tissues (brain regions, lymphoid tissues and intestine) the maximum of all sub-tissues is used for the tissue type. The tab-separated file includes Ensembl gene identifier ("Gene"), analysed sample ("Tissue") and normalized expression ("nTPM"). The data is based on The Human Protein Atlas version 21.0 and Ensembl version 103.38.
+
+RNA HPA blood cell gene data
+Transcript expression levels summarized per gene in 18 cell types and total PBMC. The tab-separated file includes Ensembl gene identifier ("Gene"), analysed sample ("Blood cell"), transcripts per million ("TPM"), protein-coding transcripts per million ("pTPM") and normalized expression ("nTPM"). The data is based on The Human Protein Atlas version 21.0 and Ensembl version 103.38.
+
+RNA HPA blood cell sample gene data
+Transcript expression levels summarized per gene in 109 blood cell samples. "rna_blood_cell_sample.tsv.zip" includes Ensembl gene identifier ("Gene"), analysed sample ("Blood cell"), donor ("Donor"), transcripts per million ("TPM"), protein-coding transcripts per million ("pTPM"). "rna_blood_cell_sample_tpm_m.tsv.zip" is in matrix format and only includes TPM. The data is based on The Human Protein Atlas version 21.0 and Ensembl version 103.38.
+
+```{r}
+hpa_ids <- blood_cell_samples %>% 
+  dplyr::select(ensg_id, hpa_gene_name=gene_name) %>% 
+  distinct()
+
+# head(hpa_ids)
+table(non.hematopoeitic.ids$gene_id %in% hpa_ids$ensg_id)
+# table(non.hematopoeitic.ids$Ensembl_v105_Gene.stable.ID %in% hpa_ids$ensg_id)
+```
+
+```{r}
+hpa_non_hematopoeitic <-  non.hematopoeitic.ids %>% 
+  dplyr::select(pAML_gene_name=gene_name, everything()) %>% 
+  left_join(., hpa_ids, by=c("gene_id"="ensg_id")) %>% 
+  mutate(ensg_id=case_when(
+    is.na(hpa_gene_name) ~ NA_character_, 
+    TRUE ~ gene_id)) %>%
+  dplyr::select(matches("gene_name|gene_id"), ensg_id, everything())
+
+missing_hpa <- hpa_non_hematopoeitic %>% 
+  dplyr::filter(is.na(hpa_gene_name)) %>% 
+  dplyr::select(pAML_gene_name:gene_id, Ensembl_v105_Gene.stable.ID:Keep) %>%
+  left_join(., hpa_ids, 
+            by=c("pAML_gene_name"="hpa_gene_name")) %>% 
+  mutate(hpa_gene_name=case_when(
+    !is.na(ensg_id) ~ pAML_gene_name,
+    TRUE ~ NA_character_,
+  )) %>%
+  arrange(ensg_id) %>% 
+  select(matches("gene_name|gene_id"), ensg_id, everything())
+
+
+hpa_non_hematopoeitic <- bind_rows(dplyr::filter(hpa_non_hematopoeitic, !is.na(hpa_gene_name)), 
+                                   filter(missing_hpa,  !is.na(ensg_id)))
+
+  
+missing_hpa <- missing_hpa %>% 
+  filter(is.na(ensg_id)) %>% 
+  dplyr::select(matches("gene_name|gene_id"),ensg_id)
+
+dim(missing_hpa) #322   3
+dim(hpa_non_hematopoeitic) #8314   28
+# table(missing_hpa$pAML_gene_name %in% AML_restricted$AMLGenes$gene_name) #18 genes missing that could be necessary :/ 
+```
+
+```{r}
+blood_cell_stats <- readRDS("Results/Non_hematopoietic_genes_approach/Human_Protein_Atlas_Non-hematopeitic_Genes_per_Immune_Cell.RDS")
+# blood_cell_stats <- blood_cell_samples %>% 
+#   filter(ensg_id %in% hpa_non_hematopoeitic$ensg_id) %>% 
+#   dplyr::select(immune_cell, gene_name=hpa_gene_name, TPM=n_tpm) %>% 
+#   group_by(immune_cell) %>% 
+#   nest() %>% 
+#   mutate(my_summary= purrr::map(data, ~summarize_expression(., cutoff=4.0, direction = "less"))) %>% 
+#   unnest(my_summary) %>% 
+#   ungroup() 
+
+# head(blood_cell_stats)
+# dim(blood_cell_stats)
+
+table(unique(blood_cell_stats$gene_name) %in% hpa_non_hematopoeitic$hpa_gene_name)
+# saveRDS(dplyr::select(blood_cell_stats,-data),
+#         "Results/Human_Protein_Atlas_Non-hematopeitic_Genes_per_Immune_Cell.RDS")
+```
+
+```{r}
+blood_cell_stats_wide <- read.csv("Results/Non_hematopoietic_genes_approach/Human_Protein_Atlas_Immune_Cells_non-hematopeoitic_genes.csv")
+
+# blood_cell_stats_wide <- blood_cell_stats %>% 
+#   mutate_at(vars(immune_cell), ~gsub(" ","_", .)) %>% 
+#   pivot_wider(id_cols=c(gene_name),
+#               names_from=immune_cell,
+#               values_from=c(Total_Number_Samples:Max_TPM),
+#               names_glue="{.value}_HPA_{immune_cell}") %>% 
+#   dplyr::select(colnames(.)[order(colnames(.))]) %>% 
+#   left_join(., select(hpa_non_hematopoeitic, 
+#                       hpa_gene_name,
+#                       pAML_gene_name,
+#                       HPA_gene_id=ensg_id), 
+#             by=c("gene_name"="hpa_gene_name")) %>%  
+#   # #Need to update the gene_name to match those in the TARGET dataset. 
+#   mutate(gene_name=pAML_gene_name) %>%
+#   dplyr::select(gene_name,
+#                 HPA_gene_id,
+#                 everything(),
+#                 -pAML_gene_name) %>%
+#   bind_rows(., dplyr::select(missing_hpa,
+#                              gene_name=pAML_gene_name,  #Need to update the gene_name to match those in the TARGET dataset.
+#                              HPA_gene_id=ensg_id))  %>%
+#   mutate_if(is.numeric, ~round(., digits = 2))
+
+
+
+# head(blood_cell_stats_wide)
+# dim(blood_cell_stats_wide) #8636  173
+
+table(blood_cell_stats_wide$gene_name %in% AML_restricted$NBM.genes$gene_name)
+# write.csv(blood_cell_stats_wide, "Results/Human_Protein_Atlas_Immune_Cells_non-hematopeoitic_genes.csv", row.names = FALSE)
+```
+
+```{r}
+hpa_PBMC_expression <- blood_cell_stats_wide %>% 
+  select(matches("gene_name|total_PBMC")) %>% 
+  dplyr::mutate(HPA_total_PBMC_Expression_Category=case_when(
+    is.na(Max_TPM_HPA_total_PBMC) ~ "gene_id not found",
+    Max_TPM_HPA_total_PBMC < 1.0 & Percent.Expressors_LT_4TPM_HPA_total_PBMC >= 75.0 ~ "absent_in_HPA_total_PBMC",  
+    Max_TPM_HPA_total_PBMC >= 1.0 & Percent.Expressors_LT_4TPM_HPA_total_PBMC >= 75.0 ~ "low_in_HPA_total_PBMC", 
+    Max_TPM_HPA_total_PBMC > 1.0 & Percent.Expressors_LT_4TPM_HPA_total_PBMC < 75.0 ~ "high_in_HPA_total_PBMC")) 
+
+
+# head(hpa_PBMC_expression, n=20)
+dim(hpa_PBMC_expression) # 8636   11
+table(hpa_PBMC_expression$HPA_total_PBMC_Expression_Category)
+
+# table(hpa_PBMC_expression$HPA_total_PBMC_Expression_Category) / nrow(hpa_non_hematopoeitic)*100
+# nrow(hpa_low_PBMC_expression)/ nrow(hpa_non_hematopoeitic) *100 #96.3% concordance for low expression in PBMCs
+# sum(AML_restricted$AMLGenes$gene_name %in%  hpa_low_PBMC_expression$gene_name) / nrow(AML_restricted$AMLGenes) * 100 #87.4% have expression in AML
+```
+
+```{r}
+hpa_Tcell_expression <- blood_cell_stats %>% 
+  filter(grepl("T-cell|NK-cell|T-reg", immune_cell)) %>%
+  mutate_at(vars(immune_cell), ~gsub(" ","_", .)) %>% 
+  arrange(gene_name) %>%
+  
+  group_by(immune_cell) %>% 
+  dplyr::mutate(Expression_Category=case_when(
+    is.na(Max_TPM) ~ "gene_id not found",
+    Max_TPM < 1.0 & Percent.Expressors_LT_4TPM >= 75.0 ~ paste0("absent_in_HPA"),  
+    Max_TPM >= 1.0 & Percent.Expressors_LT_4TPM >= 75.0 ~ paste0("low_in_HPA"), 
+    Max_TPM > 1.0 & Percent.Expressors_LT_4TPM < 75.0 ~ paste0("high_in_HPA"))) %>% 
+  ungroup() %>% 
+  select(1:2,Expression_Category) %>% 
+  pivot_wider(id_cols=c(gene_name),
+              names_from=immune_cell,
+              values_from=c(Expression_Category), 
+              names_glue="HPA_{immune_cell}_Expression_Category") %>% 
+  left_join(., select(hpa_non_hematopoeitic, 
+                      hpa_gene_name,
+                      pAML_gene_name,
+                      HPA_gene_id=ensg_id), 
+            by=c("gene_name"="hpa_gene_name")) %>%  
+  # #Need to update the gene_name to match those in the TARGET dataset. 
+  mutate(gene_name=pAML_gene_name) %>%
+  dplyr::select(gene_name,
+                HPA_gene_id,
+                everything(),
+                -pAML_gene_name) %>%
+  bind_rows(., dplyr::select(missing_hpa,
+                             gene_name=pAML_gene_name,  #Need to update the gene_name to match those in the TARGET dataset.
+                             HPA_gene_id=ensg_id))  %>%
+  mutate_at(vars(matches("Expression_Category")), ~ifelse(is.na(.), "gene_id not found", .)) %>% 
+  rename_all(~gsub("-", "\\.", .))
+
+
+head(hpa_Tcell_expression, n=20)
+dim(hpa_Tcell_expression) #8636    9
+
+
+table(hpa_Tcell_expression$gene_name %in% AML_restricted$NBM.genes$gene_name) #TRUE
+# table(hpa_Tcell_expression$`HPA_memory_CD4_T-cell_Expression_Category`)
+# write.csv(hpa_Tcell_expression,"Results/Human_Protein_Atlas_T-cell_NKcell_Immune_Cells_non-hematopeoitic_genes.csv")
+```
+
+CD4 and CD8 CAR T cells
+It is generally believed that the efficacy of adoptive cell therapy is most often attributed to CD8 T cells [88], and infusion of CD8 CAR T cells alone was sufficient for long-term B-cell eradication [89, 90]. CD4 T cells are known for their helper function and to intrinsically evoke cytolytic activities by enhancing CD8 T cells activity through cytokine production [91]. However, CD4 CAR T cells demonstrated comparable effectiveness in directly killing target tumor cells both in vitro and in vivo [79, 92, 93]. In terms of characteristics of killing dynamics, CD4 CAR T cells show initial slower granzyme B secretion and tumor killing, but are less prone to AICD and exhaustion compared to CD8 counterparts, which confers CD4 CAR T cells a relative better persistence following antigen exposure [93,94,95,96]. In most of reported clinical trials, patients have received CAR T cells products comprising random compositions of CD4 and CD8 cells, but the variation may have influenced the efficacy. Defining the 1:1 ratio of CD4:CD8 CAR T cells confers superior antitumor reactivity in vivo, indicating the synergistic antitumor effects of the two subsets [97, 98].
+
+https://ehoonline.biomedcentral.com/articles/10.1186/s40164-020-00190-2#Sec15
+
+https://www.nature.com/articles/s41596-020-0294-8#Sec14
+
+### Visualize HPA Expression
+
+```{r}
+subset_HPA <- blood_cell_samples %>% 
+  filter(ensg_id %in% hpa_non_hematopoeitic$ensg_id) %>% 
+  filter(grepl("PBMC|CD[48]|NK", immune_cell)) %>% 
+  mutate(log2_TPM=log2(n_tpm+1)) %>% 
+  select(gene_name, TPM=n_tpm, log2_TPM, everything()) 
+
+head(subset_HPA)
+g <- unique(subset_HPA$gene_name)
+range(subset_HPA$log2_TPM)
+```
+
+```{r}
+hpa_hist <- ggplot(subset_HPA, 
+                   aes(x=log2_TPM, fill=immune_cell)) +
+  geom_histogram(binwidth = 0.5) +
+  facet_wrap(~immune_cell, scales='free_x') +
+  scale_x_continuous(limits=c(-1, 12.5)) +
+  labs(y="Frequecy of TPM Value Observed in Dataset", x="log2 TPM") +
+  scale_fill_manual(values=ggpubr::get_palette("jco", 6)) +
+  theme_classic() +
+  theme(legend.position = "none")
+ 
+
+hpa_hist
+# ggsave(filename="Figures/HumanProteinAtlas_PBMC_Tcell_NKcell_non-hematopoietic_genes_histogram.pdf", plot=hpa_hist, device = "pdf", height = 5, width = 8)
+```
+
+
+# Annotate pAML Dataset Healthy Controls
+
+```{r}
+AML_restricted[["Normals"]] <- read.csv("Results/Non_hematopoietic_genes_approach/TARGET_AML_Normal_Controls_non-hematopoietic_genes_with_GTEX_and_HPA_Annots.csv")
+
+# AML_restricted[["Normals"]] <- AML_restricted$NBM.genes %>%
+#   inner_join(., AML_restricted$CD34.genes, by="gene_name") %>%
+#   dplyr::mutate(Normals_Expression_Category=case_when(
+#     bulk_NBM_Max_TPM < 1.0 & CD34_PB_Max_TPM < 1.0 ~ "absent_in_normals",
+#     bulk_NBM_Max_TPM > 1.0 | CD34_PB_Max_TPM > 1.0 ~ "low_in_normals")) %>%
+#   left_join(., select(geneID.map.anno,gene_name,
+#                       gene_id,
+#                       Cell_Surface_Protein,
+#                       Cell_Adhesion_Gene,
+#                       SialicAcidPathway,
+#                       CancerTestesAntigen_CTA),
+#             by="gene_name") %>%
+#   dplyr::select(gene_name, gene_id,
+#                 Normals_Expression_Category,
+#                 Cell_Surface_Protein,
+#                 Cell_Adhesion_Gene,
+#                 CancerTestesAntigen_CTA,
+#                 SialicAcidPathway,
+#                 everything()) %>%
+#   mutate_if(is.numeric, ~round(., digits = 2)) %>%
+#   arrange(Normals_Expression_Category,
+#           desc(Cell_Surface_Protein),
+#           desc(Cell_Adhesion_Gene),
+#           desc(CancerTestesAntigen_CTA))
+# 
+# 
+# dim(AML_restricted$Normals)
+# 
+# 
+# # Add GTEX annots
+# AML_restricted$Normals <- AML_restricted$Normals %>%
+#   left_join(., select(gtex_blood_stats_clean, gene_name, GTEX_blood_Expression_Category),
+#             by="gene_name") %>%
+#   mutate_at(vars(GTEX_blood_Expression_Category), ~ifelse(is.na(.), "alias found in gtex", .)) %>%
+#   dplyr::select(gene_name:Normals_Expression_Category,
+#                 GTEX_blood_Expression_Category,
+#                 everything())
+# 
+# 
+# 
+# #HPA normals
+# AML_restricted$Normals <- AML_restricted$Normals %>%
+#   left_join(., select(hpa_Tcell_expression, matches("gene_name|CD[48]|NK.cell")),
+#             by="gene_name") %>%
+#   left_join(., select(hpa_PBMC_expression, gene_name, HPA_total_PBMC_Expression_Category),
+#             by="gene_name") %>%
+#   dplyr::select(gene_name:Normals_Expression_Category,
+#                 matches("Expression_Category"),
+#                 everything())
+
+
+table(AML_restricted$Normals$GTEX_blood_Expression_Category)
+table(AML_restricted$Normals$HPA_memory_CD4_T.cell_Expression_Category)
+table(AML_restricted$Normals$HPA_NK.cell_Expression_Category)
+table(AML_restricted$Normals$HPA_total_PBMC_Expression_Category)
+# head(AML_restricted$Normals)
+# write.csv(AML_restricted$Normals, "Results/Non_hematopoietic_genes_approach/TARGET_AML_Normal_Controls_non-hematopoietic_genes_with_GTEX_and_HPA_Annots.csv", row.names = FALSE)
+```
+
+
+```{r}
+AMLGenes_annots <- read.csv("Results/Non_hematopoietic_genes_approach/TARGET_AML_non-hematopoietic_genes_expressed_in_AML_Q3.GT.4TPM_02.28.2022.csv")
+ 
+# AMLGenes_annots <- AML_restricted$AMLGenes %>%
+#  left_join(., select(geneID.map.anno,gene_name,
+#                       gene_id,
+#                       Cell_Surface_Protein,
+#                       Cell_Adhesion_Gene,
+#                       SialicAcidPathway,
+#                       CancerTestesAntigen_CTA),
+#             by="gene_name") %>%
+#   left_join(., select(AML_restricted$Normals,gene_name, matches("Expression_Category")), 
+#             by="gene_name") %>% 
+#   dplyr::select(gene_name, gene_id,
+#                 Gene_Meets_Expression_Min=Any_Meet_Expression_Min,
+#                 Subtypes_Enriched,
+#                 matches("Expression_Category"),
+#                 Cell_Surface_Protein,
+#                 Cell_Adhesion_Gene,
+#                 CancerTestesAntigen_CTA,
+#                 SialicAcidPathway,
+#                 matches("^AML_"),
+#                 everything()) %>%
+#   mutate_if(is.numeric, ~round(., digits = 2)) %>%
+#   arrange(desc(Gene_Meets_Expression_Min),
+#           desc(Number_of_Subtypes_with_Min_Expression),
+#           Normals_Expression_Category,
+#           desc(Cell_Surface_Protein),
+#           desc(AML_Percent.Expressors_GT_1TPM),
+#           desc(Cell_Adhesion_Gene),
+#           desc(CancerTestesAntigen_CTA)) %>% 
+#   rename_all(~gsub("-",".", .))
+
+# head(AMLGenes_annots)
+# dim(AMLGenes_annots) #8636  305
+table(AMLGenes_annots$Gene_Meets_Expression_Min) #1166
+table(AMLGenes_annots$Normals_Expression_Category)
+
+# write.csv(AMLGenes_annots,"Results/Non_hematopoietic_genes_approach/TARGET_AML_non-hematopoietic_genes_expressed_in_AML_Q3.GT.4TPM_02.28.2022.csv", row.names = FALSE)
+```
+
+```{r}
+# table(AMLGenes_annots$Gene_Meets_Expression_Min,
+#       AMLGenes_annots$Normals_Expression_Category)
+# # 
+table(AMLGenes_annots$Gene_Meets_Expression_Min)
+
+# table(AML_restricted$Normals$Normals_Expression_Category,
+#       AML_restricted$Normals$Cell_Surface_Protein)
+
+
+AMLGenes_annots %>% 
+  filter(Gene_Meets_Expression_Min) %>%  
+  group_by(Normals_Expression_Category, GTEX_blood_Expression_Category) %>% 
+  dplyr::count() %>% 
+  ungroup() %>% 
+  filter(GTEX_blood_Expression_Category != "gene_id not found")
+
+
+ 
+# table(AML_restricted$Normals$HPA_total_PBMC_Expression_Category) #310 are high (96.4% agreeent)
+# table(AML_restricted$Normals$HPA_naive_CD4_T.cell_Expression_Category) #301 are high out of 8314 (96.5% agreement)
+# table(AML_restricted$Normals$HPA_naive_CD8_T.cell_Expression_Category) #330 are high out of 8314 (96.18% agreement)
+# table(hpa_Tcell_expression$HPA_NK.cell_Expression_Category) #335 are high out 8314 (96.12% agreenebt)
+```
+
+
+# GTEX Normal Tissue Expression
+
+*Perna et al*
+https://www.sciencedirect.com/science/article/pii/S1535610817304087?via%3Dihub
+
+> Calculation of Distribution Metrics
+> In the interest of facilitating subsequent selection steps, expression entries were classified into three categories: “not detected”, “low”, “medium”, and “high”, the native format in which HPA protein and RNA data was made available. To accomplish the binning, both the HPM and PDB datasets were first log10 transformed, after HPM data was then temporarily corrected for the purpose of abundance distribution estimation so as to minimize artifactual cases in which LC-MS/MS peptide fragment masses were underdetermined, resulting in multiple gene assignments. This was accomplished by collapsing protein entries originating from the same experiment and occurring with precisely the same spectral abundance measure, into a single entry during the curve fitting process (after which all entries were restored). To fit normal curves of best fit to the observed distributions, the Broyden–Fletcher–Goldfarb–Shanno algorithm was applied (Bolker and Development Core Team, 2016), after which the peak maximum and standard deviation measure was recorded for each curve.
+
+*ADC Selection 2015 *
+https://link.springer.com/article/10.1007/s11095-015-1624-3
+
+>The expression data was subjected to further analysis in an effort to reduce the normal tissue expression to a single parameter that could be used to search for correlations with various clinical observations. A parameter termed NormScore was calculated as the number of normal tissues in which the median target expression level was in the top quartile of all genes in that tissue. Each tissue was assigned a value of 0 or 1; for tissues that are represented in GTEx by multiple regions, expression in the top quartile of any region was translated to a score of 1, since expression even in one region could potentially elicit toxicity. 
+
+<!-- # gtex_blood_stats_clean <- gtex_blood_stats %>%  -->
+<!-- #   left_join(., dplyr::select(non.hematopoeitic.gtex, gene_name, GTEX_gene_id=ensembl_ID),  -->
+<!-- #             by="gene_name") %>%  -->
+<!-- #   bind_rows(., dplyr::select(missing, gene_name, GTEX_gene_id=ensembl_ID)) %>%  -->
+
+```{r}
+#Define which non-hematopeoitic genes are expressed in AML and those that lack gene annotations in the gtex dataset
+aml_expressed_genes <- AMLGenes_annots %>% 
+  filter(Gene_Meets_Expression_Min) %>% 
+  pull(gene_name)
+
+non.hematpc.gtex.aml <- gtex_blood_stats_clean %>% 
+  select(gene_name, GTEX_gene_id) %>% 
+  filter(gene_name %in% aml_expressed_genes)  %>% 
+  left_join(., select(gtex_idmap, 
+                        GTEX_gene_id="ensembl_ID", GTEX_gene_name=gene),
+            by="GTEX_gene_id")
+
+# dim(non.hematpc.gtex.aml) 
+# head(non.hematpc.gtex.aml)
+```
+
+
+```{r}
+GTEX.normal.long <- readRDS("Expression_Data/TOIL_GTEX_normal_tissue_samples_gencode.v23.annotation_TPM_long.fmt.csv")
+
+
+# GTEX.normal.long <- 2^gtex.TPM.full[,gtex_normal_tissues$sample] %>% 
+#   rownames_to_column("gene_id") %>% 
+#   pivot_longer(cols = matches("^GTEX"), 
+#                names_to = "sample",
+#                values_to="TPM") %>% 
+#   left_join(., gtex_normal_tissues, by="sample") %>% 
+#   left_join(., gtex_idmap, by=c("gene_id"="ensembl_ID"))
+
+
+
+# dim(GTEX.normal.long)
+# head(GTEX.normal.long)
+length(unique(GTEX.normal.long$gene_id))
+# any(is.na(GTEX.normal.long$gene)) #FALSE
+# saveRDS(GTEX.normal.long, "Expression_Data/TOIL_GTEX_normal_tissue_samples_gencode.v23.annotation_TPM_long.fmt.csv")
+```
+
+```{r}
+calc_gtex_expn_cats <- function(GTEX.normal.long, genes_of_interest, tissues, gene_threshold=0.75){
+  
+  library(foreach)
+  #complete this analysis for each tissue in parallel
+  doParallel::registerDoParallel()
+  foreach::getDoParRegistered()
+  foreach::getDoParWorkers()
+  
+    gtex_summary_stats <- foreach::foreach(tissue=tissues, 
+                                .packages=c("tibble","dplyr","tidyr"),
+                                .verbose = T) %dopar% {
+    
+    tissue_Q3 <-  GTEX.normal.long %>% #includes all ~60K genes 
+        filter(X_primary_site==tissue) %>%  
+        summarize(Q3=quantile(TPM, probs=0.75)) %>% 
+      pull(Q3)
+    
+    dummy_df <- filter(genes_of_interest, is.na(GTEX_gene_id)) %>%
+      mutate(X_primary_site=tissue)
+  
+    tissue_expression <- GTEX.normal.long %>% 
+        filter(X_primary_site==tissue) %>% 
+        filter(gene_id %in% genes_of_interest$GTEX_gene_id) %>% 
+        add_row(dummy_df) %>% 
+        group_by(X_primary_site, gene) %>%
+        summarize(gene_threshold_TPM=quantile(TPM, probs=gene_threshold, na.rm=T),
+                  Absent=all(TPM < 1.0, na.rm=T), 
+                  .groups='keep') %>%
+        ungroup() %>%
+        mutate(Tissue_Expression_Category=factor(case_when(
+          is.na(gene_threshold_TPM) ~ "gene_id not found",
+          Absent ~ "absent",
+          gene_threshold_TPM <= tissue_Q3 ~ "low",
+          gene_threshold_TPM > tissue_Q3 ~ "high"), levels=c( "high","gene_id not found","low", "absent"))) %>%
+    mutate(tissue_rank=round(scales::rescale(as.numeric(Tissue_Expression_Category), 
+                                             to=c(0,1)), digits = 1))
+  
+  } %>% 
+    bind_rows()
+    
+    return(tissue_expression)
+}
+```
+
+
+   
+```{r}
+gtex_summary_stats <- readRDS("Results/Non_hematopoietic_genes_approach/TOIL_GTEX_normal_tissues_included_Tissue_Expression_Category_03.01.2022.RDS")
+
+# tissues <- unique(gtex_normal_tissues$X_primary_site)
+# gtex_summary_stats <- calc_gtex_expn_cats(GTEX.normal.long, non.hematpc.gtex.aml, tissues=tissues)
+
+#Update the gene sybmols to match the TARGET and GTEX datasets 
+# gtex_summary_stats <- gtex_summary_stats %>% 
+#   left_join(., non.hematpc.gtex.aml,
+#             by=c("gene"="GTEX_gene_name")) %>% 
+#   mutate_at(vars(gene_name), ~case_when(
+#     is.na(.) ~ gene,
+#     TRUE ~ .)) %>%
+#   select(X_primary_site,GTEX_gene_name=gene, 
+#          gene_name, GTEX_gene_id, everything())
+
+all(gtex_summary_stats$gene_name %in% AMLGenes_annots$gene_name)#TRUE
+
+# saveRDS(gtex_summary_stats, "Results/Non_hematopoietic_genes_approach/TOIL_GTEX_normal_tissues_included_Tissue_Expression_Category_03.01.2022.RDS")
+```
+  
+
+```{r}
+all_aml_targets <- ordered_tile_plots(gtex_summary_stats)
+all_aml_targets
+# ggsave(plot = all_aml_targets, filename = "Figures/TOIL_GTEX_normal_tissues_included_all_non-hematopoietic_genes.pdf",
+#        device="pdf", height = 10, width = 15)
+```
+
+```{r fig.height=10, fig.width=15}
+low_normal_expn <- gtex_summary_stats %>% 
+  filter(gene %in% combined_tissue_ranks$gene[1:c(nrow(combined_tissue_ranks)/3)])
+  
+low_normal_targets <- ordered_tile_plots(low_normal_expn) +
+  coord_equal(ratio = c(7))
+
+# low_normal_targets
+# ggsave(plot = low_normal_targets, filename = "Figures/TOIL_GTEX_normal_tissues_included_lowest_third_non-hematopoietic_genes.pdf",
+#        device="pdf", height = 10, width = 15)
+```
+
+
+##old example 
+
+```{r}
+bladder_example <- GTEX.normal.long %>% 
+  filter(X_primary_site=="Bladder") 
+
+head(bladder_example)
+# length(unique(bladder_example$gene_id)) #OKs
+# 
+# length(unique(filter(GTEX.normal.long, X_primary_site=="Bladder")[["gene_name"]]))
+tissue_Q3 <- quantile(bladder_example$TPM, probs=0.75)
+dummy_df <- filter(non.hematpc.gtex.aml, is.na(gene_id)) %>%
+  mutate(X_primary_site="Bladder")
+
+tissue_expression_example <- GTEX.normal.long %>% 
+      filter(X_primary_site=="Bladder") %>% 
+      filter(gene_id %in% non.hematpc.gtex.aml$gene_id) %>% 
+      add_row(dummy_df) %>% 
+      group_by(X_primary_site, gene) %>%
+      summarize(Q3=quantile(TPM, probs=0.75, na.rm=T),
+                Absent=all(TPM < 1.0, na.rm=T), 
+                .groups='keep') %>%
+      ungroup() %>%
+      mutate(Tissue_Expression_Category=factor(case_when(
+        is.na(Q3) ~ "gene_id not found",
+        Absent ~ "absent",
+        Q3 <= tissue_Q3 ~ "low",
+        Q3 > tissue_Q3 ~ "high"), levels=c( "high","gene_id not found","low", "absent"))) %>%
+  mutate(tissue_rank=round(scales::rescale(as.numeric(Tissue_Expression_Category),to=c(0,1)), digits = 1))
+
+
+options(scipen = 999)
+tissue_expression_example
+
+length(unique(tissue_expression_example$gene)) #1152
+length(unique(tissue_expression_example$X_primary_site)) #23
+```
+
+
+# Genomic Regions and Gene Aliases
+
+```{r}
+missing_alias <- alias %>%
+  mutate(in_symbol=symbol %in% missing$gene_name, 
+         in_nomenclature=symbol_from_nomenclature_authority %in% missing$gene_name, 
+         in_synonyms=synonyms %in% missing$gene_name) %>% 
+  dplyr::filter(in_symbol | in_nomenclature | in_synonyms) %>%
+  arrange(symbol) %>% 
+  group_by(symbol) %>%
+  mutate(matched_pAML=case_when(
+    in_symbol ~ symbol,
+    in_nomenclature ~ symbol_from_nomenclature_authority,
+    in_synonyms ~ synonyms,
+    TRUE ~ "Remove")) %>%
+  ungroup()
+
+# missing_alias
+# length(unique(missing_alias$symbol)) #64 recovered, ugh. its frankly got more margin of error than just finding genes that map to the same locations. 
+# table(missing_alias$matched_pAML %in% gtex_idmap$gene) #but NONE are in the gtex ids either...
+```
+
+```{r message=FALSE, warning=FALSE}
+gtf_file <- file.path(dirname(TARGET),"Reference_Data/GRCh38/gtf/gencode.v29.annotation.gtf")
+out <- file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/SQL/GRCh38_gencode_v29_TxDB.sqlite")
+
+GRCh38_DB <- AnnotationDbi::loadDb(out)
+# GRCh38_DB <- makeTxDbFromGFF(file=gtf_file,
+#                              format="gtf",
+#                              organism="Homo sapiens",
+#                              dataSource="GRCh38")
+# GRCh38_DB
+# AnnotationDbi::saveDb(GRCh38_DB, out)
+
+gencode_v23 <- GRanges(seqnames = S4Vectors::Rle(gtex_idmap$chrom),
+                       ranges=IRanges::IRanges(start=gtex_idmap$chromStart, end = gtex_idmap$chromEnd),
+                       strand=S4Vectors::Rle(gtex_idmap$strand))
+
+gencode_v23$gene_name <- gtex_idmap$gene
+gencode_v23$gene_id <- gtex_idmap$ensembl_ID
+
+# head(gencode_v23)
+
+ref_genes <- genes(GRCh38_DB)
+names(ref_genes) <- gsub("\\.[0-9]{1,2}","", names(ref_genes))
+ref_genes$gene_id <- gsub("\\.[0-9]{1,2}","", names(ref_genes))
+
+
+missing_gr <- ref_genes[missing$gene_id]
+missing_gr$gene_name <- missing$gene_name
+
+overlaps <- findOverlaps(gencode_v23, missing_gr, 
+                                      type="start",
+                                      select="first") #22 hits with equal, 44 with start, 64 with the aliases, 153 with any overlap 
+
+keep_by_overlap <- data.frame(gtex_index=1:length(overlaps),
+                   pAML_index=overlaps) %>% 
+  dplyr::filter(!is.na(pAML_index)) %>% 
+  dplyr::filter(!duplicated(pAML_index))
+
+length(unique(keep_by_overlap$pAML_index)) #153 have overlapping ranges
+
+# missing_gr[order(missing_gr)]
+# found_by_intersection[order(found_by_intersection)]
+
+merged_by_loc <- as.data.frame(gencode_v23[keep_by_overlap$gtex_index]) %>% 
+  bind_cols(as.data.frame(missing_gr[keep_by_overlap$pAML_index]) %>% 
+              rename_all(~paste0(.,"_pAML"))) %>% 
+  mutate(percent_overlap=round((width/width_pAML)*100, digits = 2)) %>% 
+  dplyr::select(matches("gene_name|gene_id"), percent_overlap, everything()) %>% 
+  arrange(percent_overlap)
+
+# merged_by_loc
+```
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

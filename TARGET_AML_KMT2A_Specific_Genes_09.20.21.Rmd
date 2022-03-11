@@ -1,0 +1,726 @@
+---
+title: "Genes Highly Expressed in AML"
+author: "Jenny Smith, Ben Huang"
+date: "April 07, 2021"
+output: html_document
+---
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, 
+                      fig.align='center', fig.height = 10,
+                      fig.width = 10)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'/2018.02.12_AML_Specific_Transcripts/'))
+options(stringsAsFactors=FALSE,  java.parameters = "-Xmx4g",
+        bitmapType = 'cairo',device='x11' )
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message=FALSE}
+# library(Cairo)
+library(tibble)
+library(tidyr)
+library(purrr)
+library(dplyr)
+library(magrittr)
+library(stringr)
+
+library(ggplot2)
+library(gridExtra)
+
+# library(ggpubr)
+# library(ggridges)
+# library(reshape2)
+# library(patchwork)
+
+# library(DeGSEA) #need to install 
+
+getwd()
+```
+
+#Define Functions
+
+```{r}
+norm_dist <- function(gene_expn, package="MASS"){
+  
+  if(package == "fitdistrplus"){
+    library(fitdistrplus)
+    FIT <- fitdistrplus::fitdist(gene_expn, "norm")    ## note: it is "norm" not "normal"
+    return(FIT)
+  }else if(package == "MASS"){
+    library(MASS)
+    fit <- fitdistr(gene_expn,densfun =  "normal")
+    para <- fit$estimate
+    # hist(geneA_NBM, prob = TRUE)
+    # curve(dnorm(x, para[1], para[2]), col = 2, add = TRUE)
+    return(para)
+  }
+}
+```
+
+
+
+#Read in the Clinical Data and File Manifest
+
+```{r}
+# merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_03.17.21.csv"))
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"))
+
+
+inelig <- filter(merged, Eligibility_Comments == "remove") %>%  
+  pull(USI)
+
+merged <- merged %>% 
+  dplyr::filter(!is.na(USI),
+                !grepl( "Unknown", USI)) %>% 
+  filter(Eligibility_Comments != "remove") %>% 
+  set_rownames(.$USI)
+
+
+head(merged[,1:5])
+dim(merged) #2217  150
+``` 
+
+```{r}
+# dir(file.path(TARGET, "SequencingDataMatrix/"))
+manifest <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) %>% 
+  filter(!USI %in% inelig)
+
+
+dim(manifest)
+head(manifest) #3045   15 (3036   after removing ineligibles)
+```
+
+```{r}
+CDE.gtex <- read.table(file.path(TOIL,"Clinical/TOIL_Sample_Info/TcgaTargetGTEX_phenotype.txt"), 
+                  stringsAsFactors = FALSE, sep="\t", header=TRUE)
+
+# head(CDE.gtex[,1:5])
+dim(CDE.gtex) #19,131  samples by   7 cols
+```
+
+
+
+# Gene Level  Expression Data
+
+```{r}
+gene.cts.full <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/00_Archive/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_GeneLevel_dupGenesRemoved_scaledTPM_counts.RDS"))
+colnames(gene.cts.full)[ grep("PATGIG|PATISD", colnames(gene.cts.full))] <- gsub("_replicate","", grep("PATGIG|PATISD", colnames(gene.cts.full), value=T)) 
+
+
+dim(gene.cts.full) #58263  1575
+head(gene.cts.full[,1:5])
+
+# any(duplicated(gene.cts.full$gene_name)) #FALSE
+```
+
+```{r}
+gene.TPM.full <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/00_Archive/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_GeneLevel_dupGenesRemoved_Abundance_TPM.RDS"))
+colnames(gene.TPM.full)[ grep("PATGIG|PATISD", colnames(gene.TPM.full))] <- gsub("_replicate","", grep("PATGIG|PATISD", colnames(gene.TPM.full), value=T)) 
+
+
+
+dim(gene.TPM.full)
+head(gene.TPM.full[,1:5])
+```
+
+```{r}
+transcript.TPM.full <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/transcript_level/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_TranscriptLevel_Abundance_TPM.RDS"))
+colnames(transcript.TPM.full)[grep("PATGIG|PATISD", colnames(transcript.TPM.full))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(transcript.TPM.full), value=T))
+
+
+
+dim(transcript.TPM.full)
+head(transcript.TPM.full[,1:5])
+```
+
+
+```{r}
+gtex.TPM.full <- readRDS("Expression_Data/TOIL_TARGET_TGCA_GTEX__rsem_gene_tpm.RDS")
+
+
+head(gtex.TPM.full[,1:5])
+dim(gtex.TPM.full) #60498 19260
+```
+
+
+
+# Genes of Interest
+
+```{r}
+GOI <- c("FOLR1","CLECL1", "SCUBE1","LTK", "LAMP5", "MSLN", "CLEC2A", "COL23A1", "CD70", "SPAG6", "CRLF2", "CSPG4", "CEACAM6")
+
+length(GOI)
+
+goi.regex <- paste(GOI, collapse = "|")
+goi.regex
+```
+
+```{r}
+exp.val <- c("MSLN","CLEC2A","CD70","CRLF2","CSPG4","CEACAM6")
+
+goi.val <- paste(exp.val, collapse="|")
+goi.val
+```
+
+```{r}
+adultTargets <- read.delim("References/Sadelain_AML_Restricted_Proteins_2017_list.txt", header = FALSE) %>% 
+  distinct() %>% 
+  rename_all(~ c("gene_name")) %>% 
+  mutate(Top4_Saledain=case_when(
+    grepl("ADGRE2|CCR1|CD70|LILRB2", gene_name) ~ "Yes", 
+    TRUE ~ ""))
+
+head(adultTargets)
+dim(adultTargets)
+table(adultTargets$Top4_Saledain)
+```
+
+
+# Define Samples 
+
+```{r}
+table(manifest$Batch)
+```
+
+```{r}
+samples_to_select <- manifest %>% 
+  filter(grepl("^AML$|^FlowSorted|NBM|CD34_PB", Group) & grepl("diagnostic|NBM|CD34_PB", Time_point)) %>% 
+  filter(Sample %in% colnames(gene.TPM.full)) %>% 
+  filter(!grepl("_replicate", Sample)) %>%  
+  
+  
+  left_join(., dplyr::select(merged,ETS_Fusion, USI, matches("FLT3.ITD.positive|NPM.mut|CEBPA.mut")), 
+            by="USI") %>% 
+  filter(!USI %in% inelig) %>% 
+  mutate(Major.Group=case_when(
+    grepl("KMT2A", Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV) ~ "KMT2A",
+    grepl("RUNX1-RUNX1T1", Primary.Fusion) | grepl("RUNX1-RUNX1T1", Additional.Fusions.CNV) ~ "RUNX1-RUNX1T1",
+    grepl("CBFB-MYH11", Primary.Fusion) | grepl("CBFB-MYH11", Additional.Fusions.CNV) ~ "CBFB-MYH11",
+    grepl("NUP98-(KDM5A|NSD1)", Primary.Fusion) ~ Primary.Fusion,
+    grepl("ETS|ETV|FUS", ETS_Fusion) ~ "ETS",
+    grepl("CBFA2T3-GLIS2", Primary.Fusion) ~ Primary.Fusion,
+    grepl("^No |^None$", Primary.Fusion) & grepl("Yes", FLT3.ITD.positive.) & !grepl("Yes",CEBPA.mutation.) & !grepl("Yes",NPM.mutation.) ~ "FLT3-ITD",
+    grepl("^No |^None$", Primary.Fusion) & !grepl("Yes", FLT3.ITD.positive.) & !grepl("Yes",CEBPA.mutation.) & grepl("Yes",NPM.mutation.) ~ "NPM1",
+    grepl("^No |^None$", Primary.Fusion) & !grepl("Yes", FLT3.ITD.positive.) & grepl("Yes",CEBPA.mutation.) & !grepl("Yes",NPM.mutation.) ~ "CEBPA",
+    grepl("^No |^None$", Primary.Fusion) ~ "No.Primary.Fusion",
+    TRUE ~ Group)) %>% 
+  mutate_at(vars(Major.Group), ~gsub("-",".", .) %>% 
+              gsub("^AML$", "AML.NOS", .)) %>% 
+  mutate(USI1=USI, 
+         USI=Sample) %>% 
+  set_rownames(.$Sample)
+
+  
+dim(samples_to_select) #
+
+table(samples_to_select$Group)
+table(samples_to_select$Major.Group) 
+
+# write.csv(samples_to_select, "Expression_Data/TARGET_AML_Input_Samples_for_AMLRestrictedGenes_Analysis_6.22.21.csv", row.names = F)
+```
+
+```{r}
+table(samples_to_select$Batch)
+```
+
+
+# Subset Counts 
+
+```{r}
+samps <- intersect(colnames(gene.TPM.full),samples_to_select$Sample) #missing Stella
+
+gene_ids <- gene.TPM.full[,c(1:2)]
+gene.RBD <- gene.TPM.full[,samps]
+rownames(gene.RBD) <- gene_ids$gene_name
+
+head(gene.RBD[,1:5])
+dim(gene.RBD) #58263  
+```
+
+```{r}
+gene_ids <- gene.cts.full[,c(1:2)]
+gene.cts <- gene.cts.full[,samps]
+rownames(gene.cts) <- gene_ids$gene_name
+
+
+head(gene.cts[,1:5])
+dim(gene.cts) #58263  
+```
+
+```{r}
+tx_TPM <- transcript.TPM.full[,samps]
+
+
+
+head(tx_TPM[,1:5])
+dim(tx_TPM) #
+```
+
+
+
+# Gene ID References
+
+```{r}
+geneID.map.anno <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt")) %>% 
+  filter(gene_id %in% gene_ids$gene_id) %>% 
+  mutate(misannotation=case_when(
+    Cell_Adhesion_Gene=="Yes" & Cell_Surface_Protein=="Yes" ~ "OK", #will need to check these as they are primarily HPA antibody staining evidence with 1 ab (weak evidence)
+    Cell_Adhesion_Gene=="Yes" & grepl("Transcription|Transcription regulation", Uniprot_Keywords) ~ "Yes",
+    Cell_Adhesion_Gene=="Yes" & grepl("MIR[0-9]|MIRLET[0-9]", gene_name) ~ "Yes",
+    Cell_Adhesion_Gene=="Yes" & is.na(Cellular.Compartment_Membrane) & 
+      !c(grepl("Cell adhesion|Secreted|Signal|Cell junction", Uniprot_Keywords) |
+           grepl("Cell Junctions", Additional.location_HumanProteinAtlas)) ~ "ambiguous",
+    Cell_Adhesion_Gene=="Yes" & !is.na(Cellular.Compartment_Membrane) ~ "OK",
+    TRUE ~ "OK")) %>% 
+  mutate_at(vars(Cell_Adhesion_Gene), ~case_when(
+    misannotation == "Yes" ~ "",
+    TRUE ~ .)) %>% 
+  mutate_at(vars(Cell_Surface_Protein), ~case_when(
+    gene_name=="PRAME" ~ "",
+    TRUE ~ .)) %>% 
+  select(-misannotation)
+
+
+head(geneID.map.anno[,1:5])
+# dim(geneID.map.anno) #58263    23 
+# write.table(geneID.map.anno,"Expression_Data/gencode.v29_RepBase.v24.01_GeneLevel_dupGenesRemoved_IDmap_anno_5.14.21.txt", row.names = FALSE, sep="\t")
+
+
+# filter(geneID.map.anno, gene_name=="PRAME")
+```  
+
+```{r}
+transcriptID.map <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_TranscriptLevel_IDmap_1.18.20.txt"))
+
+dim(transcript.TPM.full)
+```
+
+```{r}
+AMLGenes <- read.delim("ALL_GENES.output.candidate_genes.gt50percent_gt2stdev_for1subtype.v3.tsv", sep="\t", header = FALSE) %>% 
+  rename_all(~c("gene_name","enriched_subtypes"))
+
+
+head(AMLGenes)
+# dim(AMLGenes) #993   2
+```
+
+```{r}
+TOIL.ID.Map <- read.table("References/probeMap_gencode.v23.annotation.gene.probemap", stringsAsFactors=FALSE, sep="\t", header=TRUE)
+
+
+TOIL.ID.Map <- TOIL.ID.Map %>%
+  mutate(ensembl_ID=str_split_fixed(id, "\\.", n=2)[,1]) %>%
+  mutate(UpdateENSG=case_when(
+    ensembl_ID=="ENSG00000130201" ~ "ENSG00000283632", #ensembl old version
+    TRUE ~ ensembl_ID)) %>% 
+  dplyr::select(ensembl_ID, id, everything())
+
+
+
+# head(TOIL.ID.Map)
+dim(TOIL.ID.Map)
+# write.csv(TOIL.ID.Map, "Expression_Data/TOIL_TARGET_TCGA_GTEX_probeMap_gencode.v23.annotation.gene.probemap.csv", row.names = FALSE)
+```
+
+
+# Select Protein Coding Genes
+
+```{r}
+protein.coding.genes <- geneID.map.anno %>% 
+  filter(grepl("protein_coding", gene_type)) #TR_[A-Z]_gene immunoglobin and T-cell receptor genes
+
+
+table(protein.coding.genes$gene_type) #19901
+```
+
+
+# Gather TPM values into Long Format
+
+```{r}
+TPM.long <- gene.RBD[protein.coding.genes$gene_name,] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene_name") %>%
+  gather(Sample, TPM, -gene_name,) %>%
+  left_join(., samples_to_select, by="Sample") %>%
+  mutate(AMLvsNormals=ifelse(grepl("CD34_PB|NBM", Major.Group), "Normal", "AML"))
+
+
+head(TPM.long)
+dim(TPM.long)
+# grep("^NA\\.",  TPM.long$gene_name, value=TRUE)
+# unique(grep("SEPT|^MAR", TPM.long$gene_name, value=TRUE))
+```
+
+
+# What makes a good Target?
+
+ADD LIT REVIEW HERE
+
+
+# KMT2A Expressed Genes 
+
+```{r}
+KMT2A.genes <- AMLGenes %>% 
+  filter(grepl("kmt2a",enriched_subtypes))
+
+dim(KMT2A.genes)
+```
+
+```{r}
+KMT2A.stats <- TPM.long %>% 
+  filter(gene_name %in% KMT2A.genes$gene_name) %>% 
+  filter(grepl("KMT2A|NBM", Primary.Fusion)) %>% 
+  
+  #Create single column for the direct comparison of KM2TA as a whole vs NBM samples
+  mutate(AMLvsNBM=ifelse(grepl("NBM", Group), "NBM", "KMT2A")) %>% 
+  
+  #testing
+  # filter(gene_name %in% KMT2A.genes$gene_name[1]) %>% 
+  
+  #Define KMT2A-Subtypes
+  group_by(Primary.Fusion, gene_name) %>%
+  mutate(KMT2A.Group=case_when(
+    n() >= 10 & AMLvsNBM != "Normal" ~ paste0(Primary.Fusion,"_N.",n()),
+    n() < 10 & AMLvsNBM != "Normal" ~ "KMT2A-X",
+    TRUE ~ AMLvsNBM))  %>%
+  ungroup() %>%
+  group_by(KMT2A.Group,gene_name) %>%
+  mutate(KMT2A.Group=ifelse(KMT2A.Group=="KMT2A-X", paste0(KMT2A.Group, "_N.", n()), KMT2A.Group)) %>%
+  ungroup() %>%
+
+  #calculate the mean expression for KMT2A vs NBM
+  group_by(gene_name,AMLvsNBM) %>%
+  mutate(mean_TPM=mean(TPM)) %>%
+  ungroup() %>%
+
+  #Calculate differences in expression and FCs
+  group_by(gene_name) %>%
+  mutate(KMT2A_vsNBM_p.value=format(wilcox.test(TPM~AMLvsNBM, paired=FALSE)$p.value,
+                                         digits = 3),
+         KMT2A_vsNBM_log2_FC=round(log2(unique(mean_TPM[AMLvsNBM=="KMT2A"])) - log2(unique(mean_TPM[AMLvsNBM=="NBM"])),
+                                                 digits = 2)) %>%
+  ungroup()
+
+
+#Use purrr to apply the same wilcox.test to each KMT2A-Fusion subtype
+KMT2A.stats.subtypes <- purrr::map_dfr(unique(KMT2A.stats$KMT2A.Group)[unique(KMT2A.stats$KMT2A.Group) != "NBM_N.68"], function(subtype){
+  
+  df <- KMT2A.stats %>% 
+    filter(KMT2A.Group==subtype | KMT2A.Group=="NBM_N.68") 
+  
+  Colnames <- paste0(subtype,c("_vsNBM_log2_FC","_vsNBM_p.value"))
+  
+  df <- df %>%
+      #calculate the mean expression in each AML vs Normal hematopoeitic tissues per KMT2A subtype
+      group_by(gene_name,AMLvsNBM) %>%
+      mutate(mean_TPM=mean(TPM)) %>%
+      ungroup() %>% 
+      # #Calculate differences in expression and FCs
+      group_by(gene_name) %>%
+      mutate(!!Colnames[1] := round(log2(unique(mean_TPM[AMLvsNBM=="KMT2A"])) - log2(unique(mean_TPM[AMLvsNBM=="NBM"])), digits = 2)) %>% 
+      mutate(!!Colnames[2] := wilcox.test(TPM ~ AMLvsNBM, paired=FALSE)$p.value) %>%
+      ungroup() %>% 
+      filter(AMLvsNBM!="NBM") %>%
+      select(gene_name, one_of(Colnames)) %>% 
+      distinct() %>% 
+      pivot_longer(cols=matches("KMT2A"), names_to = "stat",  values_to="value")
+}) %>% 
+  pivot_wider(id_cols=gene_name, names_from=stat, values_from=value)
+
+# KMT2A.stats.subtypes
+
+#Collect summary stats of the Normal tissues and KMT2A as whole group
+KMT2A_and_Normals <- TPM.long %>% 
+  filter(gene_name %in% KMT2A.genes$gene_name) %>% 
+  filter(grepl("KMT2A|CD34_PB|NBM", AML_Subtype)) %>% 
+  mutate(AML_Subtype=gsub("_","", AML_Subtype)) %>% 
+  group_by(gene_name, AML_Subtype) %>%
+  summarize(min=min(TPM),
+            Q1=quantile(TPM, probs = c(0.25)),
+            median=median(TPM),
+            Q3=quantile(TPM, probs=c(0.75)),
+            perc90th=quantile(TPM, probs = c(0.90)),
+            mean=mean(TPM),
+            max=max(TPM),
+            percent_expressors=round((sum(TPM >= 1.0)/n())*100, digits = 2)) %>%
+  mutate(Range=max-min) %>%
+  ungroup() %>% 
+  pivot_wider(id_cols=gene_name,
+              names_from=AML_Subtype, 
+              values_from=min:Range,
+              names_glue="{AML_Subtype}_{.value}") %>% 
+  rename_at(vars(matches("KMT2A|CD34PB|NBM")),~paste0(.,"_TPM"))
+
+
+# KMT2A_and_Normals
+
+#Complete summary stats of each KMT2A Fusion Group
+KMT2A.stats <- KMT2A.stats %>% 
+
+  #Create summary stats by more detailed KMT2A groups
+  group_by(gene_name, KMT2A.Group,
+           KMT2A_vsNBM_log2_FC, #ensure not to lose these columns
+           KMT2A_vsNBM_p.value #ensure not to lose these columns
+           ) %>%
+  summarize(min=min(TPM),
+            Q1=quantile(TPM, probs = c(0.25)),
+            median=median(TPM),
+            Q3=quantile(TPM, probs=c(0.75)),
+            mean=mean(TPM),
+            max=max(TPM),
+            percent_expressors=round((sum(TPM >= 1.0)/n())*100, digits = 2)) %>%
+  mutate(Range=max-min) %>%
+  ungroup() %>%
+
+  #make into wide format for summary stat columns
+  dplyr::select(gene_name, KMT2A.Group,KMT2A_vsNBM_log2_FC,KMT2A_vsNBM_p.value, min:Range) %>%
+  gather(Stat,Value, min:Range) %>%
+  pivot_wider(id_cols = c(gene_name,KMT2A_vsNBM_log2_FC,KMT2A_vsNBM_p.value),
+              names_from=c(KMT2A.Group,Stat),
+              values_from=Value) %>%
+  distinct() %>%
+
+  #Fix column names 
+  rename_at(vars(matches("KMT2A")), ~paste0(.,"_TPM")) %>%
+  rename_at(vars(matches("_vsNBM")), ~gsub("_TPM","", .)) %>%
+
+  #Merge in the gene annotations
+  left_join(.,KMT2A.stats.subtypes, by="gene_name") %>% 
+  left_join(., KMT2A_and_Normals, by="gene_name") %>% 
+  left_join(., geneID.map.anno, by=c("gene_name")) %>%
+  left_join(., AMLGenes, by=c("gene_name")) %>%
+  
+  #Round the numeric values 
+  mutate_if(is.numeric, ~round(., digits = 2)) %>%
+  mutate_at(vars(matches("_vsNBM_p.value")), ~p.adjust(., method = "BH")) %>% 
+  rename_at(vars(matches("_vsNBM_p.value")), ~gsub("p.value","adj.p.value", .)) %>% 
+  
+  #Order the columns and rows
+  dplyr::select(colnames(.)[order(colnames(.))]) %>%
+  arrange(desc(Cell_Surface_Protein), desc(KMT2A_percent_expressors_TPM)) %>%
+  dplyr::select(gene_name,Cell_Surface_Protein, Cell_Adhesion_Gene,
+                CancerTestesAntigen_CTA,enriched_subtypes,
+                Treatment.type,
+                matches("^KMT2A_"),
+                matches("^NBM|^CD34"),
+                everything()) %>%
+  select( -c(Cellular.Compartment_Membrane:Extracellular.location_HumanProteinAtlas))
+
+
+# head(KMT2A.stats)
+# dim(KMT2A.stats) #200
+```
+
+```{r}
+#Select genes with low expression in the Normal BM and PB 
+#Select genes with higher expression in at least 1  all KMT2A as a group or the KMT2A subtpyes
+sel_KMT2A_genes <- KMT2A.stats %>%
+  filter(CD34PB_perc90th_TPM < 1.0, NBM_perc90th_TPM < 1.0)  %>% 
+  select(gene_name, matches("KMT2A.+Q3")) %>% 
+  pivot_longer(cols=matches("KMT2A.+Q3"),values_to="Q3", names_to="group") %>% 
+  group_by(gene_name) %>% 
+  mutate(Keep=case_when(
+    any(Q3 >= 5.0) ~ TRUE,
+    TRUE ~ FALSE)) %>% 
+  arrange(desc(Q3)) %>% 
+  filter(Keep)
+
+
+length(unique(sel_KMT2A_genes$gene_name))
+# table(sel_KMT2A_genes$Keep)
+```
+
+```{r}
+# filter(sel_KMT2A_genes, gene_name=="FUT5")
+# table(sel_KMT2A_genes$Keep)
+# quantile(KMT2A.stats.low$KMT2A_max_TPM)
+```
+
+```{r}
+KMT2A.stats.low <- KMT2A.stats %>% 
+   filter(CD34PB_perc90th_TPM < 1.0, NBM_perc90th_TPM < 1.0)  %>% 
+  filter(gene_name %in% sel_KMT2A_genes$gene_name) %>% 
+  select(-matches("perc90th")) %>% 
+  arrange(desc(Cell_Surface_Protein), desc(KMT2A_percent_expressors_TPM))
+
+
+KMT2A.stats.low
+dim(KMT2A.stats.low) #30 genes
+
+
+# write.csv(KMT2A.stats.low, "TARGET_AML_KMT2A_Restricted_Genes_08.11.21.csv", row.names = FALSE)
+# write.csv(KMT2A.stats.low, "TARGET_AML_KMT2A_Restricted_Genes_KMT2A.GT.5TPMinQ3_Normals.90perc.LT.1TPM_09.27.21.csv", row.names = FALSE)
+```
+
+```{r}
+KMT2A.stats.low %>% 
+  select(gene_name, matches("_vsNBM_log2_FC")) %>% 
+  gather(stat, value, -gene_name) %>% 
+  arrange(value)
+  
+```
+
+
+## Normal Blood
+
+4	RNA consensus tissue gene data
+Consensus transcript expression levels summarized per gene in 62 tissues based on transcriptomics data from three sources: HPA, GTEx and FANTOM5. The consensus normalized expression ("NX") value is calculated as the maximum NX value for each gene in the three data sources. For tissues with multiple sub-tissues (brain regions, blood cells, lymphoid tissues and intestine) the maximum of all sub-tissues is used for the tissue type. The tab-separated file includes Ensembl gene identifier ("Gene"), analysed sample ("Tissue") and normalized expression ("NX"). The data is based on The Human Protein Atlas version 20.1 and Ensembl version 92.38.
+
+RNA HPA blood cell gene data
+Transcript expression levels summarized per gene in 18 blood cell types and total PBMC. The tab-separated file includes Ensembl gene identifier ("Gene"), analysed sample ("Blood cell"), transcripts per million ("TPM"), protein-coding transcripts per million ("pTPM") and normalized expression ("NX"). The data is based on The Human Protein Atlas version 20.1 and Ensembl version 92.38.
+
+
+
+### CLEC2A Transcript Expression vs Gene Expression
+
+```{r}
+CLEC2A.ref <- transcriptID.map %>% 
+  filter(gene_name=="CLEC2A")
+
+CLEC2A.ref
+```
+
+```{r}
+CLEC2A.Txs <- tx_TPM[CLEC2A.ref$transcript_id, ] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("transcript_id") %>% 
+  gather(Sample, TPM, -transcript_id) %>% 
+  # left_join(.,select(CLEC2A.ref,gene_id:gene_name,Biotype, protein_id),
+  #           by=c("transcript_id"="transcript_id")) %>%
+
+  group_by(Sample) %>%
+  mutate(Rank=rank(TPM, ties.method = "first")) %>% 
+  mutate(DominantSpecies=case_when(
+    sum(TPM) < 1.0 ~ "NotExpressed",
+    Rank==max(Rank) ~ transcript_id[Rank==max(Rank)],
+    Rank!=max(Rank) ~ as.character("NotDominant"))) %>% 
+  ungroup() 
+
+CLEC2A.Txs.annotated <- CLEC2A.Txs %>% 
+  pivot_wider(id_cols = c(Sample,DominantSpecies),
+              names_from=transcript_id,
+              values_from=TPM) %>% 
+  group_by(Sample) %>%
+  mutate_at(vars(matches("^ENST")), ~replace(.,is.na(.),0)) %>%
+  mutate_at(vars(matches("^ENST")), sum) %>%
+  ungroup() %>% 
+
+  # #remove duplicated rows
+  filter(grepl("ENST|NotExpressed", DominantSpecies)) %>% 
+  group_by(Sample) %>% 
+  mutate_at(vars(DominantSpecies), ~case_when(
+    n() == 2 ~ .[.!="NotDominant"],
+    TRUE ~ .)) %>% 
+  ungroup() %>% 
+  filter(!duplicated(Sample)) %>% 
+
+  left_join(., select(samples_to_select,Sample,USI,Protocol,AML_Subtype,
+                      Primary.Fusion,Group,Tissue),
+            by="Sample") %>%
+  left_join(.,select(CLEC2A.ref,transcript_id,gene_name,gene_id, 
+                     Biotype_Dominant_Transcript=gene_type, protein_id),
+            by=c("DominantSpecies"="transcript_id")) %>%
+
+  arrange(AML_Subtype, DominantSpecies,
+          desc(ENST00000455827),
+          desc(ENST00000339766)) %>%
+  select(Sample,USI:Tissue,
+         gene_name,
+         gene_id,
+         DominantSpecies, 
+         protein_id,
+         matches("Biotype"), 
+         matches("^ENST"), 
+         everything())
+
+
+
+dim(CLEC2A.Txs.annotated) #2116   14
+# table(CLEC2A.Txs.annotated$DominantSpecies)
+
+# CLEC2A.Txs.annotated
+# table(CLEC2A.Txs.annotated$AML_Subtype)
+# quantile(CLEC2A.Txs.annotated$ENST00000455827, probs = seq(0,1, length.out = 11))
+# quantile(CLEC2A.Txs.annotated$ENST00000339766, probs = seq(0,1, length.out = 11))
+
+# write.csv(CLEC2A.Txs.annotated,"TARGET_AML_CLEC2A_Transcript_Expression_Kallisto_GRCh38_TPM.csv", row.names = FALSE)
+```
+
+```{r}
+# table(CLEC2A.Txs.annotated$AML_Subtype, CLEC2A.Txs.annotated$DominantSpecies)
+```
+
+```{r}
+# 158/(158+214)
+```
+
+
+Majority == "ENST00000455827"
+minority == "ENST00000339766"
+
+```{r}
+CLEC2A_gene <- TPM.long %>% 
+  filter(gene_name=="CLEC2A") %>% 
+  arrange(AML_Subtype, desc(TPM))
+
+# head(CLEC2A_gene)
+```
+
+```{r}
+CLEC2A_tx_KMT2A <- CLEC2A.Txs %>% 
+  left_join(., samples_to_select,by="Sample") %>% 
+  filter(AML_Subtype=="KMT2A") %>% 
+  arrange(desc(TPM))
+
+CLEC2A_gene_KMT2A <- CLEC2A_gene %>% 
+  filter(AML_Subtype=="KMT2A") 
+
+head(CLEC2A_tx_KMT2A)
+```
+
+```{r}
+to_compare <- c("TARGET.20.PASSYV.03A.01R","TARGET.20.PASMGW.09A.01R","TARGET.20.PASLSD.03A.01R","TARGET.20.PASJYX.09A.01R")
+
+CLEC2A_tx_KMT2A %>% 
+  filter(Sample %in% to_compare) %>% 
+  mutate(Sample=factor(Sample, levels=c(to_compare))) %>% 
+  group_by(Sample) %>% 
+  mutate(Sum_TPM=sum(TPM)) %>% 
+  ungroup() %>% 
+  select(Sample, transcript_id, TPM,Sum_TPM,DominantSpecies) %>% 
+  arrange(Sample) %>% 
+  View()
+ 
+
+CLEC2A_gene_KMT2A %>% 
+  filter(Sample %in% to_compare) %>% 
+   mutate(Sample=factor(Sample, levels=c(to_compare))) %>% 
+  arrange(Sample) %>% 
+  select(Sample, gene_name, TPM) %>% 
+  View()
+
+```
+
+
+```{r}
+
+
+
+CLEC2A_gene_KMT2A
+```
+
+
+I noticed that the max TPM for CLEC2A expression and the percent expressors in all KMT2A patients was different between these 2 spreadsheets (eg. In the CLEC2A transcript expression spreadsheet the max TPM was 23.59 with 29.83% expressors in KMT2A population compared to max TPM 35.77 and 42.78% expressors in KMT2A population). Do you know why we there is a difference between these 2 spreadsheets?
+ 
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+

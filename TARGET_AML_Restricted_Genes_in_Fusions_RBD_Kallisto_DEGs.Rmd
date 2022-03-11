@@ -1,0 +1,381 @@
+---
+title: 'Differential Expression of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "June 21, 2021"
+output: html_document
+---
+
+
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8, dpi = 600)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME, '2018.02.12_AML_Specific_Transcripts/'))
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+# library(XLConnect)
+# library(DeGSEA, lib.loc = "/home/jlsmith3/R/x86_64-pc-linux-gnu-library/3.5") #my custom build R package that used to be imported through `source()` 
+library(DeGSEA)
+library(ggalluvial)
+getwd()
+```
+
+
+
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"))
+
+inelig <- merged %>% 
+  filter(Eligibility_Comments == "remove") %>% 
+  pull(USI)
+
+
+merged <- merged %>% 
+  filter(!grepl("Unknown",USI)) %>% 
+  set_rownames(.$USI)
+
+
+# head(merged[,1:5])
+dim(merged)
+```
+
+```{r}
+manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_06.09.21.csv"))
+
+# head(manifest)
+dim(manifest)
+```
+
+
+#Define Fusion Groups on RNA-seq and Cytogenetic information
+
+1. NUP98-NSD1 t(5;11)(q35;p15.5) (PacBio)
+2. NUP98-KDM5A t(11;12)(p15;p13) 
+3. CBFA2T3-GLIS2 inv(16)(p13q24) (PacBio)
+MLL  11q23
+  4. KMT2A-MLLT3 t(9;11)(p21;q23) (PacBio)
+  5. KMT2A-MLLT10 t(10;11)(p12;q23)
+  6. KMT2A-MLLT4 t(6;11)(q27;q23) 
+  7. KMT2A-ELL t(11;19)(q23;p13.1)
+  8. KMT2A-MLLT1 t(11;19)(q23;p13.3) 
+9. RUNX1-RUNX1T1 t(8;21) (PacBio)
+10.CBFB-MYH11 inv(16)
+
+*additional_not for DE* 
+11. DEK-NUP214 t(6;9)(p22;q34)
+12. FUS-ERG  t(16;21)(p11;q22) 
+13. KMT2A-LASP1 t(11;17)(q23;q12-21)
+
+
+#Read in the Gene Annotation References
+
+https://bioconductor.org/packages/release/bioc/vignettes/tximport/inst/doc/tximport.html#limma-voom
+
+```{r}
+anno <- geneID.map.anno <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt"))
+  # filter(gene_id %in% gene_ids$gene_id) 
+
+head(anno)
+dim(anno)
+```
+
+```{r}
+lncRNA <- read.csv(file.path(HOME, "0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_Transcript.IDmap.csv")) %>%
+  select(gene_id, gene_type, gene_name) %>%
+  mutate_at(vars(gene_id),
+            funs(gsub("\\.[0-9]{1,}$", "", .))) %>%
+  unique()
+
+head(lncRNA)
+dim(lncRNA) #16066  lncRNA genes   3
+
+# write.csv(lncRNA, "~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv")
+```
+
+```{r}
+table(lncRNA$gene_type)
+```
+
+
+#Read in the counts
+
+```{r}
+gene.cts.full <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_GeneLevel_dupGenesRemoved_scaledTPM_counts.RDS"))
+colnames(gene.cts.full)[ grep("PATGIG|PATISD", colnames(gene.cts.full))] <- gsub("_replicate","", grep("PATGIG|PATISD", colnames(gene.cts.full), value=T)) 
+
+
+dim(gene.cts.full) #58263  
+head(gene.cts.full[,1:5])
+
+# any(duplicated(gene.cts.full$gene_name)) #FALSE
+```
+
+```{r}
+gene.TPM.full <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_GeneLevel_dupGenesRemoved_Abundance_TPM.RDS"))
+colnames(gene.TPM.full)[ grep("PATGIG|PATISD", colnames(gene.TPM.full))] <- gsub("_replicate","", grep("PATGIG|PATISD", colnames(gene.TPM.full), value=T)) 
+
+
+
+dim(gene.TPM.full)
+head(gene.TPM.full[,1:5])
+```
+
+
+#Define Cohorts for DE Analysis 
+
+```{r}
+samples_to_select <- manifest %>% 
+  filter(grepl("^AML$|^FlowSorted|NBM", Group) & grepl("diagnostic|NBM", Time_point)) %>% 
+  filter(Sample %in% colnames(gene.cts.full),
+         !grepl("_replicate", Sample)) %>% 
+  left_join(., dplyr::select(merged,ETS_Fusion, USI, matches("FLT3.ITD.positive|NPM.mut|CEBPA.mut")), 
+            by="USI") %>% 
+  filter(!USI %in% inelig) %>% 
+  mutate(Major.Group=case_when(
+    grepl("KMT2A", Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV) ~ "KMT2A",
+    grepl("RUNX1-RUNX1T1", Primary.Fusion) | grepl("RUNX1-RUNX1T1", Additional.Fusions.CNV) ~ "RUNX1-RUNX1T1",
+    grepl("CBFB-MYH11", Primary.Fusion) | grepl("CBFB-MYH11", Additional.Fusions.CNV) ~ "CBFB-MYH11",
+    grepl("NUP98-(KDM5A|NSD1)", Primary.Fusion) ~ Primary.Fusion,
+    grepl("ETS|ETV|FUS", ETS_Fusion) ~ "ETS",
+    grepl("CBFA2T3-GLIS2", Primary.Fusion) ~ Primary.Fusion,
+    grepl("^No |^None$", Primary.Fusion) & grepl("Yes", FLT3.ITD.positive.) & !grepl("Yes",CEBPA.mutation.) & !grepl("Yes",NPM.mutation.) ~ "FLT3-ITD",
+    grepl("^No |^None$", Primary.Fusion) & !grepl("Yes", FLT3.ITD.positive.) & !grepl("Yes",CEBPA.mutation.) & grepl("Yes",NPM.mutation.) ~ "NPM1",
+    grepl("^No |^None$", Primary.Fusion) & !grepl("Yes", FLT3.ITD.positive.) & grepl("Yes",CEBPA.mutation.) & !grepl("Yes",NPM.mutation.) ~ "CEBPA",
+    grepl("^No |^None$", Primary.Fusion) ~ "No.Primary.Fusion",
+    TRUE ~ Group)) %>% 
+  mutate_at(vars(Major.Group), ~gsub("-",".", .) %>% 
+              gsub("^AML$", "AML.NOS", .)) %>% 
+  mutate(USI1=USI, 
+         USI=Sample) %>% 
+  set_rownames(.$Sample)
+
+  
+dim(samples_to_select) #
+
+table(samples_to_select$Group)
+table(samples_to_select$Major.Group) 
+
+# write.csv(samples_to_select, "Expression_Data/TARGET_AML_Input_Samples_for_AMLRestrictedGenes_DE_Analysis_6.23.21.csv", row.names = F)
+grep("PATGIG|PATISD", samples_to_select$Sample, value=T)
+```
+
+# Subset Counts 
+
+```{r}
+samps <- intersect(colnames(gene.TPM.full),samples_to_select$Sample) #missing Stella
+
+gene_ids <- gene.TPM.full[,c(1:2)]
+gene.RBD <- gene.TPM.full[,samps]
+rownames(gene.RBD) <- gene_ids$gene_name
+
+head(gene.RBD[,1:5])
+dim(gene.RBD) #58263  
+```
+
+```{r}
+samps <- intersect(colnames(gene.cts.full),samples_to_select$Sample) #missing Stella
+
+gene_ids <- gene.cts.full[,c(1:2)]
+gene.cts <- gene.cts.full[,samps]
+rownames(gene.cts) <- gene_ids$gene_name
+
+
+head(gene.cts[,1:5])
+dim(gene.cts) #58263  1568
+```
+
+
+
+## Pairwise Fusion Groups 
+
+```{r}
+library(rslurm)
+```
+
+```{r}
+sopt <- list('nodes'='1', 
+             'partition'='campus-new',
+             'cpus-per-task'='1',
+             'ntasks'='1',
+             'mem'='20G',
+             'time' = '24:00:00',
+             'mail-type'='FAIL,END',
+             'mail-user'='jlsmith3@fredhutch.org') 
+```
+
+
+```{r}
+input <- samples_to_select %>% 
+  select(Sample, Major.Group) %>% 
+  mutate(Value=Major.Group) %>% 
+  pivot_wider(id_cols = Sample,
+              names_from=Major.Group,
+              values_from=Value) %>% 
+  mutate_at(vars(KMT2A:CBFB.MYH11),~case_when(
+    is.na(.) & NBM=="NBM" ~ "NBM",
+    TRUE ~ .)) %>% 
+  select(USI=Sample,everything(), -NBM) %>% 
+  as.data.frame() %>% 
+  set_rownames(.$USI)
+
+input
+# table(input$KMT2A)
+```
+
+```{r warning=FALSE, eval=FALSE}
+path=file.path(SCRATCH, "jlsmith3/AML_Restricted_Genes")
+setwd(path)
+
+cols <- select(input, -USI) %>% 
+  colnames(.)
+
+DEGs_NBM <- lapply(cols, function(col){ 
+  
+  keep <- !is.na(input[,col])
+  df <- input[keep,c("USI",col)]
+
+  # print(table(input[,col]))
+  # print(head(df))
+
+  slurm_call(f=twoGroups_DEGs,
+                     jobname = paste0(col,"vsNBM"),
+                     params =  list(expnData = gene.cts,
+                                    clinData = df,
+                                    col=col,
+                                    ref="NBM",
+                                    anno=FALSE,
+                                    SkipPlots=TRUE),
+                                    # ids2symbols=ID.map,
+                                    # gene.name.col="gene_name",
+                                    # BM=FALSE),
+                     global_objects = c("gene.cts","df"),
+                     slurm_options=sopt,
+                     submit = TRUE)
+} 
+) #Submitted batch job 
+```
+
+
+# Read in the DE Results
+
+```{r}
+path=file.path(SCRATCH, "jlsmith3/AML_Restricted_Genes")
+files <- dir(path=path, pattern="results_0.RDS", recursive=TRUE, full.names = TRUE) 
+files
+```
+
+```{r}
+check <- readRDS(files[2])
+
+# dim(check$DE$DE)
+# extract_DEGs(check)
+```
+
+```{r}
+# dir.create("DEGs")
+results <- list()
+for (i in 1:length(files)){
+  
+  name <- gsub("^.+rslurm_(.+)\\/.+", "\\1", files[i])
+  
+  filename <- file.path(getwd(),"DEGs") %>%
+    paste(., name, sep="/") %>% 
+    paste0(.,".RDS")
+  
+  # print(filename)
+  results[[name]] <- readRDS(files[i])
+  # file.copy(files[i], filename, overwrite = FALSE)
+}
+
+
+names(results)
+```
+
+
+
+
+
+# Extract DEGs 
+
+```{r}
+lapply(names(results),function(x){
+  
+  res <- results[[x]]
+  degs <- extract_DEGs(res) %>% 
+      select(gene_name=gene, everything()) %>% 
+     left_join(., select(gene_ids, gene_id, gene_name), 
+              by=c("gene_name")) %>% 
+    select(gene_name,gene_id, everything())
+  
+  
+  group <- gsub("vsNBM", "", x)
+  n <- table(res$phenovector)[["GroupA"]]
+
+  
+  filename <- file.path("DEGs", paste0("TARGET_AML_",group,"_vs_NBM_DEGs.csv"))
+  con <- file(filename, open="wt")
+  writeLines(paste("# Differentially expressed genes in",  group,
+                   "patient samples compared to Normal bone marrow (NBM) healthy controls"), con)
+  writeLines(paste("# Input Samples:", group, "bulk RNAseq (N=",n, ") vs  NBM bulk RNAseq (N=68)"), con)
+  write.csv(degs, con, row.names = F)
+  close(con)
+})
+```
+
+
+```{r}
+#Extract all DEGs for the Volcano plots
+lapply(names(results), function(x){
+  
+  res <- results[[x]]
+  
+  fit <- res$DE$eBayesFit
+  df <- data.frame(gene_name=rownames(fit[["coefficients"]]),
+              log2FC=fit[["coefficients"]][,1],
+              p.value=fit[["p.value"]][,1]) %>%
+    mutate(FDR=p.adjust(p.value, method = "BH")) %>%
+    left_join(., select(gene_ids, gene_id, gene_name), 
+              by=c("gene_name")) %>% 
+    arrange(desc(log2FC), desc(FDR)) %>% 
+    select(gene_name,gene_id, everything())
+  
+  group <- gsub("vsNBM", "", x)
+  n <- table(res$phenovector)[["GroupA"]]
+
+  # print(head(df))
+  # print(dim(df))
+  
+  
+  filename <- file.path("DEGs", paste0("TARGET_AML_",group,"_vs_NBM_DEGs_forVolcanoPlots.csv"))
+  con <- file(filename, open="wt")
+  writeLines(paste("# Differentially expressed genes in",  group, "patient samples compared to Normal bone marrow (NBM) healthy controls"), con)
+  writeLines(paste("# Input Samples:", group, "bulk RNAseq (N=",n, ") vs  NBM bulk RNAseq (N=68)"), con)
+  write.csv(df, con, row.names = F)
+  close(con)
+})
+```
+
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

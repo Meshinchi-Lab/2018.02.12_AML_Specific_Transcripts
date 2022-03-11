@@ -1,0 +1,1602 @@
+---
+title: "Genes Highly Expressed in AML"
+author: "Jenny Smith"
+date: "Feb 01, 2022"
+output: html_document
+---
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'/2018.02.12_AML_Specific_Transcripts/'))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE, 
+                      fig.align='center', 
+                      fig.height = 10,
+                      fig.width = 10)
+
+options(stringsAsFactors=FALSE,  java.parameters = "-Xmx4g",
+        bitmapType = 'cairo',device='x11' )
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+
+
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(DeGSEA)
+getwd()
+```
+
+# Define Functions
+
+
+```{r}
+#Function to calculate the rank for each gene based on the summary statistics, and the expression categories of the normal tissues (GTEX whole blood, and GTEX normal tissues). A higher rank indicates a "better" target. 
+calc_target_ranks <- function(AML_summary_stats_long, subtype, tissue_cols, filter_fc=1.0){
+  
+  #define column names that are dependent on the fusion subtype
+  perc <- paste0(subtype, "_Percent.Expressors_GT_1TPM")
+  median_tpm <- paste0(subtype, "_Median_TPM")
+  probs <- seq(0,1,length.out = 11)
+  
+  #Calculate the ranking values for the subtype 
+  ranked_targets <- AML_summary_stats_long %>% 
+    dplyr::select(gene_name:SialicAcidPathway,
+                  matches("Normals_Expression_Category|GTEX_blood_Expression_Category|bulk_NBM_Median_TPM|CD34_PB_Median_TPM"), 
+                  matches(paste0("^", subtype, "_")),
+                  all_of(tissue_cols)) %>% 
+    dplyr::filter(grepl(paste0("^",subtype,"$"), Subtype),
+                  Meet_Expression_min) %>% 
+  
+    #Create a column for the fold-change or log ratio values 
+    #add a small psuedocount of 0.001 to avoid INF in the fold-changes 
+    mutate(median_bulk_fc = log2(!!as.symbol(median_tpm)+1e-3) - log2(bulk_NBM_Median_TPM+1e-3)) %>% 
+    mutate(median_CD34_fc = log2(!!as.symbol(median_tpm)+1e-3) - log2(CD34_PB_Median_TPM+1e-3)) %>% 
+  
+    #A non-stringent setting to retain only with a fold-change that meets the minimum defined. 
+    filter(median_bulk_fc >= filter_fc) %>% 
+ 
+    
+    #Create a column that sums the expression categories per GTEX tissue 
+    group_by(gene_name) %>% 
+    mutate(sum_tissue_categories=sum(c_across(all_of(tissue_cols)))) %>% 
+    ungroup() %>% 
+
+    # #convert the % expressors, fold-change, and gtex category into numeric values
+    # #Note I weighted the absent in normal expression category to be the highest value (5) while all the fusion % expressors, and fold-change range from 1-4.
+    #GTEX expression category was decreased to range 0-1 due to undue weighting over the % expressors
+    mutate(Normals_rank=scales::rescale(as.numeric(Normals_Expression_Category),
+                                        to=c(0,11)),
+           
+           #Note: collapsing to unique values for the breaks, causes some issues where the % expressors lose granularity (see FUS.ERG example), where 70% and 40% are given the same rank value. 
+           # Could use rescale alone, but not sure how that will work for every fusion. 
+            Fusion_Expressors_rank=round(scales::rescale(as.numeric(cut(!!as.symbol(perc),
+                               breaks = unique(quantile(!!as.symbol(perc), probs=probs)), #some fusions have the same value for more than 1 quantile - thus may be less than 4 breaks. 
+                               include.lowest=TRUE)), 
+                               to=c(1,5)), digits = 1),
+            bulk_fc_rank=scales::rescale(as.numeric(cut(median_bulk_fc,
+                                  breaks = unique(quantile(median_bulk_fc, probs=probs)),
+                                  include.lowest=TRUE)), 
+                                  to=c(1,10)),
+            CD34_fc_rank=scales::rescale(as.numeric(cut(median_CD34_fc,
+                                  breaks = unique(quantile(median_CD34_fc, probs=probs)),
+                                  include.lowest=TRUE)), 
+                                  to=c(1,10)),
+            gtex_rank=round(scales::rescale(as.numeric(GTEX_blood_Expression_Category),
+                                           to=c(0,5)),  digits=1), 
+            total_tissue_rank=round(scales::rescale(sum_tissue_categories, 
+                                                   to=c(0,5)), digits = 1)) %>%
+
+    #Create final ranking value by summing across all 3 ranking features.
+    rowwise() %>%
+    mutate(rank=sum(c_across(matches("_rank")))) %>%
+    ungroup() %>%
+
+    select(gene_name,
+           Subtype,
+           rank,
+           matches("_rank"),
+           everything()) %>%
+    arrange(desc(rank))
+  
+  return(ranked_targets)
+}
+```
+
+```{r}
+add_column_defs <- function(target_ranks_df){
+  
+  column_defs <- data.frame(Column=colnames(target_ranks_df)) %>% 
+    mutate(Definition=case_when(
+      Column == "gene_name" ~ "gene symbol",
+      Column == "Subtype" ~ "The AML subtype which was examined", 
+      Column == "rank" ~ "The final rank of the gene target; higher values indicate a better target. The sum of Normals_rank to total_tissue_rank. [0-46]",
+      Column == "Normals_rank" ~ "Based on normals expression category (absent,low). Highest value indicates absent expression. [0,11]",
+      Column == "Fusion_Expressors_rank" ~ "Based on the % of AML expressors > 1 TPM; higher values inidcate more expressors. [1-5]",
+      Column == "bulk_fc_rank" ~ "Based on log2 median fold-change of AML/NBM; higher values indicate higher expression in AML relative to bulk NBM. [1-10]",
+      Column == "CD34_fc_rank" ~ "Based on log2 median fold-change of AML/CD34+ PB; higher values indicate higher expression in AML relative to CD34+ PB. [1-10]",
+      Column == "gtex_rank" ~ "Based on GTEX whole blood expression categories (absent,low,unknown,high); highest value indicates absent. [0-5]",
+      Column == "total_tissue_rank" ~ "Based on the sum of the GTEX normal tissues' expression categories (absent,low,unknown,high); highest values indicate absent in most tissues. [0-5]",
+      Column == "Meet_Expression_min" ~ "Does the gene meet the expression minimum (Q3 > 4TPM) for the Subtype [TRUE]",
+      # Column == "" ~ "",
+      # Column == "" ~ "",
+      TRUE ~ ""
+    )) %>% 
+    pivot_wider(names_from=Column, values_from=Definition)
+
+  colnames_row <- c("Column_Definitions"="Column Name",
+                  set_names(colnames(column_defs), values=colnames(column_defs))) %>% 
+    as.data.frame() %>% 
+    t() %>% 
+    as.data.frame()
+  
+  ranks_df <- target_ranks_df %>%
+    mutate_all(~as.character(.)) %>% 
+    add_row(.before = 1, column_defs) %>% 
+    mutate(Column_Definitions=c("# Column Definition", rep("", c(nrow(.)-1)))) %>% 
+    add_case(.after=1, colnames_row) %>% 
+    select(Column_Definitions, everything())
+  
+  return(ranks_df)
+}
+```
+
+```{r}
+#Function to use dplyr to group each ranked gene by therapy type (ADC, CART, etc) and select the top N gene targets per tyoe. 
+select_top_n <- function(target_ranks_df, subtype="", top_n=10){
+  target_ranks_df %>% 
+    select(gene_name,rank, matches("_Possible")) %>% 
+    pivot_longer(cols=matches("_Possible"), 
+                 names_to="therapy_possible", 
+                 values_to="therapy_name")  %>% 
+    filter(!is.na(therapy_name)) %>% 
+    group_by(therapy_possible, therapy_name) %>%
+    filter(!grepl("High", therapy_name)) %>% 
+    dplyr::slice_max(order_by = rank, n=top_n) %>%
+    ungroup() 
+    # pivot_wider(id_cols=gene_name, 
+    #             names_from=therapy_name, 
+    #             values_from=therapy_name) %>% 
+    # rename_at(vars(ADC:`CAR-NK`), ~paste0(subtype, "_Best_",.))
+  
+}
+```
+
+```{r}
+#Plotting function for the summary stats
+summary_stat_plot <- function(summary_stats,subtype, sel_genes=NULL){
+
+  subtype_expn_col <- paste0(subtype,"_Meet_Expression_min")
+  Columns <- c("Subtypes_Enriched", "gene_name","Cell_Surface_Protein",
+               "Normals_Expression_Category", subtype_expn_col)
+
+  assertthat::assert_that(all(Columns %in% colnames(summary_stats)),
+                          msg=glue::glue("Missing required columns {Columns} in the input dataframe."))
+
+
+  #Filter for only those genes that expressed in the selected AML subtype
+  df <- summary_stats %>%
+    filter(grepl(subtype, Subtypes_Enriched),
+           !!as.symbol(subtype_expn_col)) %>% 
+    mutate_at(vars(Cell_Surface_Protein), ~as.factor(ifelse(is.na(.), "Lacks\nEvidence", .))) %>% 
+    mutate_at(vars(Normals_Expression_Category), ~as.factor(.))
+  
+  #tabulate the number of gene targets per subtype selected
+  num_targets_df <- df %>% 
+    group_by(Cell_Surface_Protein, Normals_Expression_Category, .drop=FALSE) %>% 
+    dplyr::count() %>% 
+    ungroup()
+  
+  #make the data into long format
+  df_long <- df %>% 
+    pivot_longer(cols=matches("min_TPM|Q[13]|mean|median|max"),
+                 names_to=c("stat"),
+                 values_to=c("value")) %>% 
+    mutate_at(vars(stat), ~gsub(paste0(subtype,"_"),"", .) %>%
+                factor(., levels=paste0(c("min","Q1","Mean","Median","Q3","Max"),"_TPM")))
+
+  
+  #default genes for now - how to make this dynamic??
+  if(is.null(sel_genes)){
+    sel_genes <- unique(df$gene_name)[1:6]
+  }
+  
+  # #make a barplot with the summary statistics for ~6 genes.
+  # #maybe make this a plotly object?
+  stats <- ggplot(filter(df_long, gene_name %in% sel_genes),
+         aes(x=stat, y=value, fill=stat)) +
+    geom_col(position = position_dodge()) +
+    facet_wrap(~gene_name, scales = "free") +
+    scale_fill_brewer(palette = "Dark2") +
+    labs(x="", y="") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1),
+          strip.text = element_text(size=12),
+          panel.grid.major.x = element_blank(), 
+          legend.position = "top")
+  
+  #Plot the number of targets per selected AML subtpy
+  num_targets <-  ggplot(num_targets_df, aes(x=Cell_Surface_Protein, 
+                                 y=n,
+                                 color=Cell_Surface_Protein,
+                                 fill=Normals_Expression_Category)) +
+    geom_col(position = position_dodge(), color="black") +
+    scale_fill_brewer(palette = "Set1") +
+    labs(y="Number of Gene Targets") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1),
+          strip.text = element_text(size=12),
+          panel.grid.major.x = element_blank(), 
+          legend.position = "top", legend.title = element_blank())
+  
+  
+  # num_targets + stats + patchwork::plot_layout(widths = c(0.5, 1))
+  return(num_targets)
+  
+}
+```
+
+```{r}
+summary_stat_expn_plots <- function(TPM.long.fmt,AMLGenes_annots_long, subtype){
+  library(patchwork)
+  library(ggplot2)
+  
+  subtype_regex <- paste0("^",subtype,"$")
+  temp <- AMLGenes_annots_long %>% 
+    filter(grepl(subtype, Subtype), Meet_Expression_min) %>% 
+    mutate_at(vars(Cell_Surface_Protein), ~as.factor(ifelse(is.na(.) | .=="", "Lacks\nEvidence", .))) %>% 
+    mutate_at(vars(Normals_Expression_Category), ~as.factor(.)) 
+  
+  # length(unique(temp$gene_name))
+  # table(temp$Normals_Expression_Category, temp$Subtype)
+  
+  top6 <-  temp %>% 
+      mutate(across(matches(paste0(subtype, "_Percent.Expressors_GT_1TPM")),
+            .fns= list(to_order1 = ~ntile(., n=5)),
+            .names="{.fn}")) %>% 
+    arrange(desc(to_order1), desc(!!as.symbol(paste0(subtype,"_Median_TPM")))) %>% 
+    slice(1:6) %>% 
+    pull(gene_name)
+  
+  expn <- TPM.long.fmt %>% 
+    filter(grepl(paste0(subtype_regex, "|NBM|CD34_PB"), AML_Subtype_Detailed)) %>% 
+    inner_join(., select(temp, gene_name, Normals_Expression_Category, Cell_Surface_Protein), 
+              by="gene_name") %>% 
+    select(gene_name, AML_Subtype_Detailed, 
+           Normals_Expression_Category, everything())
+  
+  per_class <- temp %>%
+    group_by(Cell_Surface_Protein, Normals_Expression_Category, .drop=FALSE) %>% 
+    dplyr::count() %>% 
+    ungroup()
+    
+  
+  num_targets <-  ggplot(per_class, aes(x=Cell_Surface_Protein, 
+                                   y=n,
+                                   color=Cell_Surface_Protein,
+                                   fill=Normals_Expression_Category)) +
+      geom_col(position = position_dodge(), color="black") +
+      scale_fill_brewer(palette = "Set1") +
+      labs(y="Number of Gene Targets") +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1),
+            strip.text = element_text(size=12),
+            # panel.grid.major.x = element_blank(), 
+            legend.position = "top", 
+            legend.title = element_blank())
+  
+  # num_targets
+  violin_plots_all <- ggplot(expn, aes(x=AML_Subtype_Detailed,
+                                       y=log2(TPM+1),
+                                       fill=Normals_Expression_Category)) +
+    geom_point(aes(color=Normals_Expression_Category), position = position_jitterdodge( dodge.width=0.95),
+               alpha=0.6) +
+    geom_violin(draw_quantiles=0.5, scale="width", 
+                alpha=0.25, position=position_dodge()) +
+    scale_fill_brewer(palette = "Set1") +
+    scale_color_brewer(palette = "Set1") +
+    labs(x="") +
+    theme_bw() +
+    theme(legend.position = "top",
+          legend.title = element_blank())
+  
+  
+  violin_plots_top <- ggplot(filter(expn,gene_name %in% top6), 
+                               aes(x=AML_Subtype_Detailed,
+                                       y=log2(TPM+1),
+                                       fill=Cell_Surface_Protein)) +
+    geom_point(aes(color=Cell_Surface_Protein),
+               position = position_jitterdodge( dodge.width=0.95),
+               alpha=0.6) +
+    geom_violin(draw_quantiles=0.5, scale="width", 
+                alpha=0.25, position=position_dodge()) +
+    scale_fill_brewer(palette = "Dark2") +
+    scale_color_brewer(palette = "Dark2") +
+    labs(x="") +
+    facet_wrap(~gene_name) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          legend.title = element_blank())
+  
+  # violin_plot
+  
+    (num_targets + violin_plots_all) / violin_plots_top + plot_annotation(title = glue::glue("Number and Expression of Non-hematopoietic Gene Targets\nin {subtype}"))
+}
+```
+
+```{r}
+ordered_tile_plots <- function(gtex_summary_stats){
+  
+  gtex_mat <- gtex_summary_stats %>% 
+    pivot_wider(id_cols = gene_name, 
+                names_from=X_primary_site,
+                values_from=tissue_rank) %>% 
+    column_to_rownames("gene_name") %>% 
+    as.matrix()
+  
+
+  gene_c <- hclust(dist(gtex_mat), method="ward.D2")
+  gene_order <- gene_c$labels[gene_c$order]
+  
+  tissue_c <- hclust(dist(t(gtex_mat)), method="ward.D2")
+  tissue_order <- tissue_c$labels[tissue_c$order]
+  
+  
+  input <- gtex_summary_stats %>% 
+    mutate(gene_name=factor(gene_name, levels=gene_order), 
+           X_primary_site=factor(X_primary_site, levels=tissue_order))
+    # filter(Tissue_Expression_Category != "gene_id not found")
+  
+  tile_plot <- ggplot(input,
+                      aes(x=gene_name, y=X_primary_site, fill=Tissue_Expression_Category)) +
+    geom_tile(color="black") +
+    scale_fill_manual(values=c("absent"="floralwhite", 
+                               "low"="lightskyblue",
+                                "gene_id not found"="grey",
+                               "high"="orangered")) +
+    theme(legend.position = "top", 
+          axis.text.x = element_text(angle=25, hjust=1, vjust=1))
+  
+  return(tile_plot)
+}
+```
+
+```{r}
+make_multi_panel_plots <- function(subtype, col_name,
+                                   target_ranks_list_out,
+                                   AMLGenes_annots_long,
+                                   gtex_summary_stats, TPM.long.fmt){
+  
+
+    # subtype="KMT2A.MLLT10"
+    # col_name <- "Group"
+  
+   assertthat::assert_that(subtype %in% names(target_ranks_list_out),
+                            msg = "Ensure that the {subtype} name provided matches the names from the target_ranks_list_out from the target_ranks_list() function.")
+  
+    subtype_regex <- paste0("^",subtype,"$")
+    best_sel <- target_ranks_list_out[[subtype]]
+    
+    #subset the summary statistics with gene annotations to just the fusion or subtype of interest 
+    annots_subset <- AMLGenes_annots_long %>% 
+        filter(grepl(subtype_regex, Subtype), Meet_Expression_min) %>% 
+        mutate_at(vars(Cell_Surface_Protein), ~as.factor(ifelse(is.na(.) | .=="", "Lacks\nEvidence", .))) %>% 
+        mutate_at(vars(Normals_Expression_Category), ~factor(., levels=c("absent_in_normals","low_in_normals"))) 
+    
+    #filter the expression data to the genes of interest
+    TPM.long.fmt <- TPM.long.fmt %>% 
+      filter(grepl(paste0(subtype_regex,"|NBM|CD34_PB"), !!as.symbol(col_name))) %>% 
+      mutate_at(vars(AML_Subtype_Detailed), ~gsub("-", ".", .)) %>% 
+      mutate(log2_TPM=log2(TPM+1)) %>% 
+      filter(gene_name %in% unique(best_sel$gene_name)) 
+    
+    #Calculate z-scores per gene
+    #Exclude the remission and relapse samples, since they were not included in the gene rankings
+    z.scores <- TPM.long.fmt %>% 
+      filter(!grepl("relapse|remission", Time_point)) %>% 
+      group_by(gene_name) %>% 
+      mutate(z_score=(log2_TPM-mean(log2_TPM))/sd(log2_TPM)) %>% 
+      ungroup() %>% 
+      select(gene_name, log2_TPM, z_score, everything()) %>% 
+      
+      group_by(!!as.symbol(col_name),gene_name) %>% 
+      summarise(Mean_Z_Score=mean(z_score), .groups="keep") %>% 
+      ungroup() %>% 
+      mutate_at(vars(all_of(col_name)),
+                ~factor(., levels=c(subtype, "NBM","CD34_PB"))) 
+    
+    #add the gene annotations for types of targets
+    for_ridges_violins <- TPM.long.fmt %>% 
+      left_join(., annots_subset, by="gene_name") %>% 
+      rowwise() %>% 
+      mutate(for_plots=paste(unique(c(!!as.symbol(col_name), Time_point)), collapse = "; ")) %>% 
+      ungroup() %>% 
+       mutate_at(vars(all_of(col_name)),
+                ~factor(., levels=c(subtype, "NBM","CD34_PB")))
+   
+    
+    #select the "best" cell surface gene targes to plot 
+    cell_surface <- annots_subset %>% 
+      filter(gene_name %in% unique(best_sel$gene_name), 
+             Cell_Surface_Protein=="Yes") %>% 
+      pull(gene_name) %>% 
+      unique() 
+    
+    n <- length(cell_surface)
+    end <- ifelse(n > 4, 4, n)
+    cell_surface <- cell_surface[1:end]
+    
+    #create table for the number of gene targets identified in total 
+    per_class <- annots_subset %>%
+        group_by(Cell_Surface_Protein, Normals_Expression_Category, .drop=FALSE) %>% 
+        dplyr::count() %>% 
+        ungroup()
+    
+    #bar plot of the total number of gene targets identified.
+    num_targets <-  ggplot(per_class, aes(x=Cell_Surface_Protein, 
+                                       y=n,
+                                       color=Cell_Surface_Protein,
+                                       fill=Normals_Expression_Category)) +
+          geom_col(position = position_dodge(), color="black") +
+          scale_fill_brewer(palette = "Set1") +
+          labs(y="Number of Gene Targets") +
+          theme_bw() +
+          theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1),
+                strip.text = element_text(size=12),
+                legend.position = "top", 
+                legend.title = element_blank(), 
+                plot.margin=margin(0,0,0,0))
+      
+    
+    #Add re-leveled factor levels 
+    order_genes <- z.scores %>% 
+      filter(grepl(subtype, !!as.symbol(col_name))) %>% 
+      inner_join(., best_sel, by="gene_name") %>% 
+      group_by(therapy_name) %>% 
+      arrange(Mean_Z_Score,.by_group=TRUE) %>% 
+      pull(gene_name) %>% 
+      unique()
+    
+    sel_genes <- z.scores %>%
+      mutate(gene_name=factor(gene_name, levels=rev(order_genes)))
+    col_end <-  max(sel_genes$Mean_Z_Score)
+    col_start <- min(sel_genes$Mean_Z_Score)
+    
+    #Create a tile plot with the z-scores data frame
+    tile_plot <- ggplot(sel_genes,
+           aes_string(x="gene_name", y=col_name, fill="Mean_Z_Score")) +
+      geom_tile(color="black") +
+      coord_fixed() +
+      labs(x="", y="") +
+    
+      scale_y_discrete(expand=c(0,0)) +
+      scale_x_discrete(expand=c(0,0)) +
+      scale_fill_gradientn(colours = c("black","white","magenta"), 
+                             values = scales::rescale(c(col_start, 0,col_end)),
+                           guide = "colorbar",
+                           na.value = "red",
+                           limits=c(col_start,col_end)) +
+      theme_minimal() +
+      theme(axis.ticks = element_line(color="black", size = 1),
+            axis.text.y = element_text(size=10, color="black"),
+            axis.text.x = element_text(size=5, color="black", angle=45, vjust=1, hjust=1),
+            legend.text = element_text(size=10),
+            legend.title = element_text(size=10),
+            # legend.position = "left",
+            axis.title.y = element_text(size=12), 
+            plot.margin=margin(0,0,0,0))
+    
+    sel_annots <- best_sel %>% 
+      mutate(gene_name=factor(gene_name, levels=rev(order_genes)))
+    
+    #Add an annotation barplot to describe the types of therapies available
+    therapy_types <- ggplot(sel_annots,
+           aes(x=gene_name,  fill=therapy_name)) +
+      scale_fill_manual(values = ggpubr::get_palette("lancet", 4)) +
+      geom_bar() +
+      coord_fixed() +
+      theme_void() +
+      theme(plot.margin=margin(0,0,0,0))
+    
+    #ridge plot/ density plot of all "best" selected targets to show the overexpression in the AML samples
+    #only include the diagnostic samples since those were the only ones that contributed to the gene rankings 
+    ridge_plot <- ggplot(filter(for_ridges_violins,!grepl("relapse|remission", Time_point)),
+                         aes_string(y=col_name, x="log2_TPM",
+                                    fill=col_name, vline_color = "..quantile..")) +
+      ggridges::geom_density_ridges(calc_ecdf = TRUE, 
+                                    quantile_lines=TRUE, 
+                                    quantiles=2) +
+      labs(y="") +
+      scale_fill_brewer() +
+      scale_discrete_manual("vline_color",
+                            values = c("blue","red"), 
+                            name = NULL) +
+      guides(color=guide_legend(FALSE)) +
+      theme_classic() +
+      theme(legend.position = "none", 
+            axis.text = element_text(color="black",size=12), 
+            plot.margin=margin(0,0,0,0))
+    
+    #Create violin plot of the best 6 cell surface targets 
+    classes <- unique(for_ridges_violins$for_plots)
+    classes <- c(classes[-grep("NBM|CD34", classes)], classes[grep("NBM|CD34", classes)])
+    n <- length(classes)
+    df <- filter(for_ridges_violins, gene_name %in% cell_surface) %>% 
+      mutate(for_plots=factor(for_plots, levels=classes),
+             gene_name=factor(gene_name, levels=cell_surface))
+    
+    violin_plots_top <- ggplot(df, aes(x=gene_name,y=log2_TPM, fill=for_plots)) +
+            geom_point(aes(color=for_plots),
+                       position = position_jitterdodge(dodge.width=0.95, jitter.width = 0.5),
+                       alpha=0.6) +
+            geom_violin(draw_quantiles=0.5, scale="width", 
+                        alpha=0.25, position=position_dodge(width = 0.95)) +
+            scale_color_manual(values=ggpubr::get_palette("jco", n)) +
+            scale_fill_manual(values=ggpubr::get_palette("jco", n)) +
+            labs(x="") +
+            theme_bw() +
+            theme(legend.position = "bottom",
+                  legend.title = element_blank(),
+                  plot.margin=margin(0,0,0,0))
+    
+    #Create a tileplot with the GTEX Tissues 
+    gtex_summary_stats_subset <- gtex_summary_stats %>%  
+      filter(gene_name %in% unique(best_sel$gene_name)) 
+    p <- ordered_tile_plots(gtex_summary_stats = gtex_summary_stats_subset)
+    
+        (num_targets + (therapy_types / tile_plot + plot_layout(guides = "collect")) + ridge_plot) / violin_plots_top + p + plot_annotation(title = glue::glue("Number and Expression of Non-hematopoietic Gene Targets\nin {subtype}")) +  patchwork::plot_layout(heights = c(1,2,2))
+}
+```
+
+
+
+# Read in the Clinical Data and File Manifest
+
+# Raw Counts
+
+```{r}
+genome <- "GRCh38" #or GRCh37
+```
+
+
+## GRCh38 
+
+```{r}
+current_files <- dir(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/"))
+# current_files
+    
+
+if(genome=="GRCh38"){
+    grch38_cts_file <- grep("_RBD_.+scaledTPM_counts.RDS", current_files, value=TRUE)
+    cts_grch38 <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/",grch38_cts_file))
+    cts_grch38_ids <- cts_grch38[,grep("gene_id|gene_name", colnames(cts_grch38))]
+    
+    cts_grch38 <- as.data.frame(cts_grch38)
+    rownames(cts_grch38) <-  cts_grch38_ids$gene_name
+    cts_grch38 <- cts_grch38[,-grep("gene_id|gene_name", colnames(cts_grch38))]
+    
+    # head(cts_grch38[,1:5])
+    dim(cts_grch38) #58263  3021 
+    
+    ### TPM
+    grch38_TPM_file <- grep("Gencode.v29_protein-coding_geneLevel_TPM.txt", dir("Expression_Data/"), value=TRUE)
+    TPM_grch38 <- read.delim(file.path("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM.txt"), 
+                             sep="\t")
+    colnames(TPM_grch38)[grep("PATGIG|PATISD",colnames(TPM_grch38))] <- gsub("_replicate","", grep("PATGIG|PATISD",colnames(TPM_grch38), value=T))
+    # head(TPM_grch38)
+    # dim(TPM_grch38) #58263  3021
+}
+```
+
+
+https://www.proteinatlas.org/about/assays+annotation
+
+For both the HPA and GTEx transcriptomics datasets, the average TPM value of all individual samples for each human tissue or human cell type was used to estimate the gene expression level. To be able to combine the datasets into consensus transcript expression levels, a pipeline was set up to normalize the data for all samples. In brief, all TPM values per sample were scaled to a sum of 1 million TPM (denoted pTPM) to compensate for the non-coding transcripts that had been previously removed. Next, all TPM values of all samples within each data source (HPA + GTEx human tissues, HPA immune cell types, HPA cell lines) were normalized separately using Trimmed mean of M values (TMM) to allow for between-sample comparisons. The resulting normalized transcript expression values, denoted nTPM, were calculated for each gene in every sample. nTPM values below 0.1 are not visualized on the Atlas sections.
+
+```{r}
+blood_cell_samples <- readr::read_delim("References/Human_Protein_Atlas/rna_blood_cell_sample.tsv",
+                                        delim="\t", show_col_types = FALSE) %>% 
+  janitor::clean_names()
+```
+
+
+# ClinData
+
+```{r message=FALSE}
+#https://cran.r-project.org/web/packages/REDCapR/vignettes/workflow-read.html
+project <- "AML_restricted_Genes_2022"
+
+if(project==""){
+  stop("Must include Projecy name!")
+}else{
+  message(paste0("Project is: ",project))
+  current_cde_database <- paste("TARGET_AML_CDEs_For_Project",project, ".RDS", sep="_")
+
+  if(file.exists(current_cde_database)){
+    print("Reading CDEs from Rdata object.")
+    merged <- readRDS(current_cde_database)
+
+  }else{
+    print("Downloading CDEs from RedCap API.")
+    path_credential <- file.path(HOME,".redcap")
+    project_id <- 1295
+
+    credential  <- REDCapR::retrieve_credential_local(
+      path_credential = path_credential,
+      project_id = project_id)
+
+    #takes about 30 sec to download.
+    merged <- redcap_read(redcap_uri = credential$redcap_uri,
+                          token = credential$token,
+                          raw_or_label_headers = 'label')
+    if(merged$success){
+      merged <- data.frame(merged$data, check.names=TRUE) #remove the white spaces  (will this even work??)
+      saveRDS(merged, current_cde_database)
+    }
+
+    #Create a simple log file from the day the project starts
+    cat(c(paste("Date:", Sys.Date()),
+          paste("cts:", basename(get(ls(pattern = "_cts_file")))),
+          paste("tpm:", basename(get(ls(pattern = "_TPM_file")))),
+          paste("CDE:", current_cde_database)),
+          sep = "\n",
+          file = paste(project, Sys.Date(), ".log", sep="_"))
+
+  }
+
+  #keep a list of the ineligable patiens to remove if necessary
+  inelig <- merged %>%
+    dplyr::filter(Eligibility.Comments == "remove") %>%
+    pull(USI)
+
+  #Filter those with USIs and are eligible for the study
+  merged <- merged %>%
+    dplyr::filter(Eligibility.Comments != "remove")
+
+
+  dim(merged)
+  head(merged)
+
+}
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(sample_info)
+```
+
+```{r}
+rnaseq_fastqs <- read.csv(file.path(TARGET,"SequencingDataMatrix/Fastq_manifests/TARGET_AML_RNAseq_Fastq_File_Manifest_shareable_08.11.21.csv"))
+
+dim(rnaseq_fastqs)
+# head(rnaseq_fastqs)
+# table(rnaseq_fastqs$Group)
+```
+
+```{r}
+CDE.gtex <- read.table(file.path(TOIL,"Clinical/TOIL_Sample_Info/TcgaTargetGTEX_phenotype.txt"), 
+                  stringsAsFactors = FALSE, sep="\t", header=TRUE)
+
+# head(CDE.gtex[,1:5])
+dim(CDE.gtex) #19,131  samples by   7 cols
+```
+
+
+# Read in the Annotations 
+
+```{r}
+geneID.map.anno <- read.csv("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_Annotations.csv")
+
+dim(geneID.map.anno)
+```
+
+
+```{r}
+gtex_idmap <- read.csv("Expression_Data/TOIL_TARGET_TCGA_GTEX_probeMap_gencode.v23.annotation.gene.probemap.csv")
+
+head(gtex_idmap)
+```
+
+
+
+# Define Samples 
+
+```{r}
+samples_to_select <-  read.csv("Expression_Data/TARGET_AML_Input_Samples_for_AMLRestrictedGenes_Analysis_withFusionGroupsDefined_6.22.21.csv")
+
+remission_samples <- read.csv("Expression_Data/TARGET_AML_Remission_Samples_for_AMLRestrictedGenes_Analysis_withFusionGroupsDefined_02.28.2022.csv")
+
+relapse_samples <- read.csv("Expression_Data/TARGET_AML_Relapse_Samples_for_AMLRestrictedGenes_Analysis_withFusionGroupsDefined_02.28.2022.csv")
+```
+
+
+```{r}
+all_samples <- bind_rows(samples_to_select, remission_samples, relapse_samples)
+
+dim(all_samples) #2315   27
+any(duplicated(all_samples$Sample)) #OK
+```
+
+```{r}
+gtex_normal_tissues <-  read.csv("Expression_Data/TOIL_GTEX_normal_tissue_samples_included_gencode.v23.annotation_02.28.2022.csv")
+
+dim(gtex_normal_tissues)
+```
+
+# Subset Counts 
+
+```{r}
+samps <- intersect(colnames(TPM_grch38), samples_to_select$Sample) #missing Stella
+gene.RBD <- TPM_grch38[,samps]
+
+
+# head(gene.RBD[,1:5])
+# dim(gene.RBD) #58263
+```
+
+
+# TPM values Long Format
+
+```{r}
+# Gather TPM values into Long Format
+TPM.long <- readRDS("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+
+
+dim(TPM.long)
+
+# GTEX.normal.long <- readRDS( "Expression_Data/TOIL_GTEX_normal_tissue_samples_gencode.v23.annotation_TPM_long.fmt.csv")
+# 
+# dim(GTEX.normal.long)
+```
+
+```{r}
+gene.relapses.long <-  readRDS("Expression_Data/TARGET_AML_relapses_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+```
+
+```{r}
+gene.remission.long <-  readRDS("Expression_Data/TARGET_AML_remission_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+```
+
+
+```{r}
+all_samples_TPM.long <- bind_rows(TPM.long, gene.relapses.long, gene.remission.long) %>% 
+  filter(Cyto.Fusion.Molecular.Risk != "Remove")
+
+length(unique(all_samples_TPM.long$Sample))
+```
+
+
+# Annotate pAML Dataset Healthy Controls
+
+```{r}
+non.hematopoeitic.ids <- read.delim("TARGET_AML_non-hematopoeitic_genes_gencodev29_ensembl_ids.txt", sep="\t")
+
+# head(non.hematopoeitic.ids)
+```
+
+```{r}
+AML_restricted <- list()
+AML_restricted[["Normals"]] <- read.csv("Results/Non_hematopoietic_genes_approach/TARGET_AML_Normal_Controls_non-hematopoietic_genes_with_GTEX_and_HPA_Annots.csv") 
+
+
+# table(AML_restricted$Normals$GTEX_blood_Expression_Category)
+# table(AML_restricted$Normals$HPA_memory_CD4_T.cell_Expression_Category)
+# table(AML_restricted$Normals$HPA_total_PBMC_Expression_Category)
+# table(AML_restricted$Normals$HPA_NK.cell_Expression_Category)
+
+# colnames(AML_restricted$Normals)
+head(AML_restricted$Normals)
+```
+
+```{r}
+AMLGenes_annots <- read.csv("Results/Non_hematopoietic_genes_approach/TARGET_AML_non-hematopoietic_genes_expressed_in_AML_Q3.GT.4TPM_02.28.2022.csv") 
+
+
+head(AMLGenes_annots)
+dim(AMLGenes_annots)
+table(AMLGenes_annots$Gene_Meets_Expression_Min) #1166
+# write.csv(filter(AMLGenes_annots, Gene_Meets_Expression_Min), "Results/TARGET_AML_non-hematopoietic_genes_expressed_in_AML_Q3.GT.4TPM_02.28.2022_Subset.csv")
+```
+
+```{r}
+# AMLGenes_annots$ 
+```
+
+
+# Provide Rankings of Genes per each Subtype 
+
+*NOTE for gene ranking 
+  -  include to those absent expn in NBMs, 
+  - rank those with low expn in NBM 1) most percent expressors in AML, 
+                                    2) largest positive median fold-change 
+                                    3) absent/low expression in GTEX whole blood
+                                    4) lowest number of normal tissues with high expression
+  - then annotate - CD4/8 CART development possible, or CAR-NK cell (based on lacking "high" expression in those tissues)
+  - then annotate - ADC development possible due to cell surface gene 
+  - then annotate - TCR mimic 
+  
+
+CAR-T and CAR-NK 
+https://www.nature.com/articles/s41434-021-00246-w
+
+
+TCR-mimics
+https://www.frontiersin.org/articles/10.3389/fimmu.2020.585385/full 
+
+ADC
+https://www.frontiersin.org/articles/10.3389/fphar.2019.00373/full
+
+Ideally, the antigen should express highly and homogeneously on the surface of the cancer cells (Sievers and Senter, 2013; Damelin et al., 2015). When the antibody combines with the antigen specifically, the antibody-antigen complex should be internalized by antigen-mediated endocytosis, and then the free payloads are released through lysosomal trafficking. As a result, the payloads are concentrated in cancer cells and exert the cytotoxic effect (Erickson et al., 2006).
+
+
+```{r}
+# most_pts <- AMLGenes_annots_long %>% 
+#   filter(grepl("^AML$", Subtype), Meet_Expression_min) %>% 
+#   filter(AML_Percent.Expressors_GT_1TPM>=80) %>% 
+#   select(gene_name, Cell_Surface_Protein, everything())
+```
+
+```{r}
+gtex_summary_stats <- readRDS("Results/Non_hematopoietic_genes_approach/TOIL_GTEX_normal_tissues_included_Tissue_Expression_Category_03.01.2022.RDS") %>% 
+  filter(X_primary_site!="Prostate") #remove prostate tissue from the tissues examined. 
+
+gtex_wide <- gtex_summary_stats %>%
+    pivot_wider(id_cols = gene_name,
+                names_from=X_primary_site,
+                values_from=tissue_rank) %>%
+  janitor::clean_names()
+
+dim(gtex_wide)
+```
+
+```{r}
+AMLGenes_annots_long <- AMLGenes_annots %>% 
+  filter(Gene_Meets_Expression_Min) %>% 
+  
+  #Create columns for the potential therapy that could be developed for each gene 
+  rowwise() %>% 
+  mutate(CD4_CD8_CART_Possible=case_when(
+    Cell_Surface_Protein=="" ~ NA_character_,
+    any(grepl("low|absent", c_across(cols=matches("CD[48]_")))) & Cell_Surface_Protein=="Yes" ~ "CAR-T",
+    any(grepl("high", c_across(cols=matches("CD[48]_")))) ~ "High Expn in CD4/8 T-cells")) %>%
+  mutate(NK_CAR_Possible=case_when(
+    Cell_Surface_Protein=="" ~ NA_character_,
+    any(grepl("low|absent", c_across(cols=matches("NK.cell_")))) & Cell_Surface_Protein=="Yes" ~ "CAR-NK",
+    any(grepl("high", c_across(cols=matches("NK.cell_")))) ~ "High Expn in NK-cells")) %>%
+  ungroup() %>% 
+  mutate(ADC_or_TCRmimic_possible=case_when(
+    Cell_Surface_Protein=="Yes" ~ "ADC", 
+    TRUE ~ "TCR-mimic")) %>% 
+  
+  #Include the GTEX expression categories
+  left_join(., gtex_wide, 
+            by=c("gene_name"="gene_name")) %>% 
+  
+  #Conver the expression category for the normal tissues into factors with levels to help with ranking process 
+  mutate(GTEX_blood_Expression_Category=factor(GTEX_blood_Expression_Category, levels=rev(c("absent_in_GTEX_blood", 
+                                                                                        "low_in_GTEX_blood",
+                                                                                        "gene_id not found",
+                                                                                        "high_in_GTEX_blood"))), 
+         Normals_Expression_Category=factor(Normals_Expression_Category, levels=c("low_in_normals", "absent_in_normals"))) %>% 
+  
+  #Make the annotations into long format so each AML subtype can be used to subset the annots into 1 gene per row per AML subtype. 
+  pivot_longer(cols =  matches("Meet_Expression_min"),
+               values_to="Meet_Expression_min",
+               names_to="value") %>%
+  mutate(Subtype=gsub("-", ".", gsub("_Meet_Expression_min", "", value))) %>%
+  
+  select(gene_name,
+         Subtype,
+         Meet_Expression_min, 
+         value,
+         CD4_CD8_CART_Possible:ADC_or_TCRmimic_possible, everything())
+
+
+head(AMLGenes_annots_long)
+# length(unique(AMLGenes_annots_long$gene_name)) #1166
+```
+
+### Positive FC Filter 
+
+```{r}
+subtypes <- unique(AMLGenes_annots_long$Subtype)
+tissues <- colnames(gtex_wide)[-1]
+
+target_ranks_list <- purrr::map(subtypes,calc_target_ranks,
+                                AML_summary_stats_long = AMLGenes_annots_long, 
+                                tissue_cols=tissues, 
+                                filter_fc=0)
+names(target_ranks_list) <- subtypes
+
+length(target_ranks_list)
+sapply(target_ranks_list, dim)
+```
+
+```{r}
+ranks_df <- lapply(target_ranks_list,add_column_defs)
+names(ranks_df) <- names(target_ranks_list)
+
+# lapply(names(ranks_df), function(x) {
+#     filename <- paste0("Results/Non_hematopoietic_genes_approach/gene_rankings_filter_0logFC_v4/TARGET_AML_non-hematopoietic_genes_expressed_logFC_GT.0_in_",x,"_.csv")
+#     write.table(x=ranks_df[[x]], file = filename, row.names = F, col.names = F, sep=",")
+# })
+
+```
+
+```{r}
+best_selections <- purrr::map2(.x=target_ranks_list,
+                               .y=subtypes,  
+                               .f=select_top_n, top_n=10)
+
+# best_selections
+# lapply(best_selections, head)
+# n_targets <- sapply(best_selections, function(x) length(unique(pull(x, gene_name))))
+# n_targets[order(n_targets)]
+
+# best_selections$High_risk
+```
+
+### Filter > 1 FC
+
+```{r}
+subtypes <- unique(AMLGenes_annots_long$Subtype)
+tissues <- colnames(gtex_wide)[-1]
+
+target_ranks_list_filt <- purrr::map(subtypes,calc_target_ranks,
+                                AML_summary_stats_long = AMLGenes_annots_long, 
+                                tissue_cols=tissues, 
+                                filter_fc=1.0)
+names(target_ranks_list_filt) <- subtypes
+
+length(target_ranks_list_filt)
+sapply(target_ranks_list_filt, dim)
+```
+
+```{r}
+# lapply(names(target_ranks_list_filt), function(x){
+#   filename <- paste0("Results/Non_hematopoietic_genes_approach/gene_rankings_filter_1logFC_v4/TARGET_AML_non-hematopoietic_genes_expressed_logFC_1x_in_",x,"_.csv")
+#   write.csv(target_ranks_list_filt[[x]], filename, row.names = F)
+# })
+```
+
+```{r}
+ranks_df_filt <- lapply(target_ranks_list_filt,add_column_defs)
+names(ranks_df_filt) <- names(target_ranks_list_filt)
+
+# lapply(names(ranks_df_filt), function(x) {
+#     filename <- paste0("Results/Non_hematopoietic_genes_approach/gene_rankings_filter_1logFC_v4/TARGET_AML_non-hematopoietic_genes_expressed_logFC_1x_in_",x,"_.csv")
+#     write.table(x=ranks_df_filt[[x]], file = filename, row.names = F, col.names = F, sep=",")
+# })
+```
+
+```{r}
+best_selections_filt <- purrr::map2(.x=target_ranks_list_filt,
+                               .y=subtypes,
+                               .f=select_top_n,
+                               top_n=10)
+
+sapply(best_selections_filt, function(x) length(unique(x$gene_name)))
+```
+
+
+
+# Visualization of Gene Targets
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/R/Heatmaps_Function.r")
+```
+
+## Heatmap global view
+
+```{r}
+expressed_in_AML <- AMLGenes_annots$gene_name[AMLGenes_annots$Gene_Meets_Expression_Min]
+length(expressed_in_AML)
+```
+
+```{r}
+non_hematpc_subset <- as.matrix(log2(gene.RBD[non.hematopoeitic.ids$gene_name,samples_to_select$Sample]+1))
+non_hematpc_subset <- non_hematpc_subset[rowSums(non_hematpc_subset) > 0, ]
+
+# class(non_hematpc_subset)
+dim(non_hematpc_subset) # 3 genes with all expression == 0 
+range(non_hematpc_subset)
+# head(non_hematpc_subset[,1:5])
+```
+
+```{r}
+set.seed(1)
+# library(viridis)
+groups <- unique(samples_to_select$AML_Subtype)
+colors_aml <- c(rbind(viridis::inferno(7, begin = 0.1),
+                      viridis::mako(7, begin=0,end=1))) %>% 
+  .[1:length(groups)] %>% 
+  set_names(groups) 
+colors_aml[c("No.Primary.Fusion","RUNX1-RUNX1T1",
+             "NBM","CD34_PB")] <- c("azure1","burlywood3","black","grey")
+
+par(mar=c(10,2,2,2))
+barplot(rep(1,13), col=colors_aml, names.arg = names(colors_aml), las=2)
+
+#"deepskyblue3","deepskyblue2",
+# pal <- circlize::colorRamp2(c(-4,-2, 0, 2, 4,6, 8),
+#                       c("deepskyblue4", "deepskyblue1",
+#                         "white",
+#                         "red1","red2", "red3","red4"),
+#                       space="sRGB")
+pal <- circlize::colorRamp2(seq(0,10, by=2),
+                      c("snow1",RColorBrewer::brewer.pal(5,"Greys")),
+                      space="sRGB")
+
+
+
+cols <- c("Group", "AML_Subtype")
+cc <- list(Group=c("AML"="firebrick2", "CD34_PB"="grey", "NBM"="black"), 
+           AML_Subtype=colors_aml)
+
+hmap_anno <- DeGSEA::create_HA_Labs_Hmap(expn=non_hematpc_subset,
+                                         geneList = rownames(non_hematpc_subset),
+                                         CDE = samples_to_select, 
+                                         cols=cols, 
+                                         colorbar.height=3,
+                                         cc=cc)
+```
+
+```{r fig.height=7, fig.width=15}
+all_non_hematpc <- ComplexHmap(mat = non_hematpc_subset,
+                               scale = FALSE,
+                               name="log2 TPM", 
+                               hmap_anno_obj = hmap_anno$annoColumn, 
+                               color_palette=pal)
+
+
+# pdf("Figures/TARGET_AML_8633_non_hematopoietic_genes_heatmap.pdf", height = 10, width = 17)
+all_non_hematpc
+# dev.off()
+```
+
+### AML expressed genes 
+
+```{r fig.height=7, fig.width=15}
+expn_AML_non_hematpc <- ComplexHmap(mat = non_hematpc_subset[expressed_in_AML, ],
+                               scale = FALSE, 
+                               name="log2 TPM", 
+                               hmap_anno_obj = hmap_anno$annoColumn, 
+                               color_palette=pal)
+
+
+# pdf("Figures/TARGET_AML_1166_non_hematopoietic_genes_expressed_in_AML_heatmap.pdf", height = 10, width = 17)
+expn_AML_non_hematpc
+# dev.off()
+```
+
+
+```{r fig.height=8, fig.width=15}
+genes_sel <- unique(best_selections$AML$gene_name)
+aml_best <- non_hematpc_subset[genes_sel, ]
+
+hmap_anno <- DeGSEA::create_HA_Labs_Hmap(expn= aml_best,
+                                         geneList = genes_sel,
+                                         CDE = samples_to_select, 
+                                         goi=genes_sel,
+                                         cols=cols, 
+                                         colorbar.height=3,
+                                         cc=cc)
+
+expn_AML_enriched <- ComplexHmap(mat = aml_best,
+                               scale = FALSE, 
+                               hmap_anno_obj_genes = hmap_anno$geneLabels,
+                               name="log2 TPM", 
+                               hmap_anno_obj = hmap_anno$annoColumn, 
+                               color_palette=pal)
+
+
+n <- unique(best_selections$AML$gene_name) %>% length()
+# pdf(paste0("Figures/TARGET_AML_", n,"_non_hematopoietic_genes_expressed_AML_heatmap.pdf"), height = 10, width = 17)
+draw(expn_AML_enriched,
+     heatmap_legend_side="top", 
+     annotation_legend_side="right")
+# dev.off()
+```
+
+
+## Multi-Panel with z-scores per gene per fusion
+
+
+#### By Risk Group 
+
+
+```{r}
+risk_groups <- unique(TPM.long$Cyto.Fusion.Molecular.Risk)
+risk_groups <- risk_groups[-grep("NBM|CD34_PB", risk_groups)]
+annots_filtered <- bind_rows(target_ranks_list_filt)
+
+multi_plots_risk <- purrr::map(risk_groups, make_multi_panel_plots,
+                                  col_name="Cyto.Fusion.Molecular.Risk",
+                                  target_ranks_list_out = best_selections_filt,
+                                  AMLGenes_annots_long=annots_filtered,
+                                  gtex_summary_stats=gtex_summary_stats,
+                                  TPM.long=all_samples_TPM.long)
+
+names(multi_plots_risk) <- risk_groups
+```
+
+```{r fig.height=10, fig.width=15}
+# for(i in 1:length(multi_plots_risk)){
+#   filename <- paste0("Figures/non_hematopoietic_ranking_Log2FC_GT.1x_v4/TARGET_AML_",names(multi_plots_risk)[i], "_heatmap_violin_multipanel.pdf")
+#   print(filename)
+#   pdf(filename, height = 12, width = 15)
+#   print(multi_plots_risk[[i]])
+#   dev.off()
+# }
+```
+
+
+
+#### By Fusion 
+
+```{r}
+subtypes_1 <- unique(all_samples_TPM.long$AML_Subtype_Detailed)
+subtypes_1 <- subtypes_1[-grep("NBM|CD34_PB", subtypes_1)]
+subtypes_1 <- gsub("-",".", subtypes_1)
+annots_filtered <- bind_rows(target_ranks_list_filt)
+
+multi_plots_fusions <- purrr::map(subtypes_1, make_multi_panel_plots,
+                                  col_name="AML_Subtype_Detailed",
+                                  target_ranks_list_out = best_selections_filt,
+                                  AMLGenes_annots_long=annots_filtered,
+                                  gtex_summary_stats=gtex_summary_stats,
+                                  TPM.long=all_samples_TPM.long)
+
+names(multi_plots_fusions) <- subtypes_1
+```
+
+
+```{r fig.height=10, fig.width=15}
+# for(i in 1:length(multi_plots_fusions)){
+#   filename <- paste0("Figures/non_hematopoietic_ranking_Log2FC_GT.1x_v4/TARGET_AML_",names(multi_plots_fusions)[i], "_heatmap_violin_multipanel.pdf")
+#   print(filename)
+#   pdf(filename, height = 12, width = 15)
+#   print(multi_plots_fusions[[i]])
+#   dev.off()
+# }
+```
+
+#### By AML vs NBM 
+
+```{r}
+amlvsnbm <- unique(all_samples_TPM.long$Group)
+amlvsnbm <- amlvsnbm[-grep("NBM|CD34_PB", amlvsnbm)]
+annots_filtered <- bind_rows(target_ranks_list_filt)
+
+multi_plots_amlvsnbm <- purrr::map(amlvsnbm, make_multi_panel_plots,
+                                  col_name="Group",
+                                  target_ranks_list_out = best_selections_filt,
+                                  AMLGenes_annots_long=annots_filtered,
+                                  gtex_summary_stats=gtex_summary_stats,
+                                  TPM.long=all_samples_TPM.long)
+
+names(multi_plots_amlvsnbm) <- amlvsnbm
+```
+
+
+```{r fig.height=10, fig.width=15}
+f <- paste0("Figures/non_hematopoietic_ranking_Log2FC_GT.1x_v4/TARGET_AML_heatmap_violin_multipanel.pdf.pdf")
+pdf(f, height = 12, width = 15)
+multi_plots_amlvsnbm$AML
+dev.off()
+```
+
+
+## boxplots / Violin plots
+
+
+```{r}
+AMLGenes_annots_long <- AMLGenes_annots %>% 
+  filter(Gene_Meets_Expression_Min) %>% 
+  pivot_longer(cols =  matches("Meet_Expression_min"), 
+               values_to="Meet_Expression_min", 
+               names_to="value") %>% 
+  mutate(Subtype=gsub("-", ".", stringr::str_split_fixed(value, pattern="_", n=2)[,1])) %>% 
+  mutate_at(vars(Subtype), ~case_when(
+    grepl("^KMT2A$|^ETS$|^NUP98$", .) ~ paste0(.,"_Fusion"), 
+    TRUE ~ .
+  )) %>% 
+  select(gene_name,Subtype, Meet_Expression_min, value, everything())  
+          
+
+head(AMLGenes_annots_long, n=20)
+table(AMLGenes_annots_long$Subtype)
+```
+
+
+```{r}
+subtypes <- AMLGenes_annots_long %>% 
+  filter(!grepl("^AML$|^KMT2A_F|^ETS_|^NUP98_F", Subtype)) %>% 
+  pull(Subtype) %>% 
+  unique()
+
+stats_plots <- purrr::map(subtypes, 
+                          summary_stat_expn_plots, 
+                          TPM.long.fmt=TPM.long, 
+                          AMLGenes_annots_long=AMLGenes_annots_long)
+names(stats_plots) <- subtypes
+```
+
+```{r fig.height=10, fig.width=12}
+# sapply(names(stats_plots), function(x){
+#   outfile <- paste0("Figures/TARGET_AML_",x,"_non-hematopoietic_genes_plots.pdf")
+#   ggsave(filename = outfile, plot = stats_plots[[x]], device="pdf", height=10, width=12)
+# })
+```
+
+
+
+## Riverplot
+
+https://cran.r-project.org/web/packages/ggalluvial/vignettes/ggalluvial.html
+
+```{r}
+gene_cats <- geneID.map.anno %>% 
+  mutate(Protein_coding="coding",
+         Non_hematopoietic=gene_name %in% "", 
+         AML_expressed=gene_name %in% "")
+```
+
+
+## Barplots 
+
+```{r}
+per_class <- AMLGenes_annots %>%
+  filter(Gene_Meets_Expression_Min) %>% 
+  mutate_at(vars(Cell_Surface_Protein), ~as.factor(ifelse(is.na(.) | .=="", "Lacks\nEvidence", .))) %>% 
+  mutate_at(vars(Normals_Expression_Category), ~as.factor(.)) %>% 
+  group_by(Cell_Surface_Protein, Normals_Expression_Category, .drop=FALSE) %>% 
+  dplyr::count() %>% 
+  ungroup()
+  
+# per_class
+
+num_targets <-  ggplot(per_class, aes(x=Cell_Surface_Protein, 
+                                 y=n,
+                                 color=Cell_Surface_Protein,
+                                 fill=Normals_Expression_Category)) +
+    geom_col(position = position_dodge(), color="black") +
+    scale_fill_brewer(palette = "Set1") +
+    labs(y="Number of Gene Targets") +
+    scale_y_continuous(breaks=seq(0,400, by=50)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1),
+          strip.text = element_text(size=12),
+          panel.grid.major.x = element_blank(), 
+          legend.position = "top", legend.title = element_blank())
+
+num_targets
+# ggsave("Figures/TARGET_AML_non-hematopoietic_genes_expressed_in_AML_barplot.pdf", dpi=300, device = "pdf", height = 5, width = 7, units = "in")
+```
+
+```{r}
+# NUP98_targets <- AMLGenes_annots %>% 
+#   filter(grepl("NUP98-NSD1", Subtypes_Enriched)) %>% 
+#   dplyr::select()
+```
+
+
+## ridge plots/density plots
+
+```{r}
+
+```
+
+
+
+## oncoprints
+
+Make Subtypes_enriched an oncroprint - such that fusion is on the rows, and presence of 1TPM per sample are the positives. 
+
+```{r}
+
+```
+
+
+# Distribution of all Genes Expression
+
+Calculation of Distribution Metrics
+In the interest of facilitating subsequent selection steps, expression entries were classified into three categories: “not detected”, “low”, “medium”, and “high”, the native format in which HPA protein and RNA data was made available. To accomplish the binning, both the HPM and PDB datasets were first log10 transformed, after HPM data was then temporarily corrected for the purpose of abundance distribution estimation so as to minimize artifactual cases in which LC-MS/MS peptide fragment masses were underdetermined, resulting in multiple gene assignments. This was accomplished by collapsing protein entries originating from the same experiment and occurring with precisely the same spectral abundance measure, into a single entry during the curve fitting process (after which all entries were restored). To fit normal curves of best fit to the observed distributions, the Broyden–Fletcher–Goldfarb–Shanno algorithm was applied (Bolker and Development Core Team, 2016), after which the peak maximum and standard deviation measure was recorded for each curve.
+
+
+```{r fig.height=5, fig.width=5}
+
+mintpm <- min(log2(TPM.long$TPM+1)) #0
+maxtpm <- max(log2(TPM.long$TPM+1)) #19.5
+  
+hist <- ggplot(data=TPM.long, aes(x=log2(TPM+1))) +
+  geom_histogram(binwidth = 0.5, fill="dodgerblue",color="dodgerblue") +
+  geom_vline(xintercept = log2(5+1), color="red", linetype="dashed") + 
+  geom_vline(xintercept = log2(5+1), color="red", linetype="dashed") + 
+  labs(y="Frequency of TPM Value", title = "RNA-seq gene_name Expression Distribution") + 
+  scale_x_continuous(breaks = seq(mintpm,maxtpm, by=1)) +
+  theme_bw()
+
+# png("TARGET_AML_RNAseq_Gene_Expression_Distribution.png", height = 5, width = 5, units="in", res=300)
+hist
+# dev.off()
+length(unique(TPM.long$gene_name)) #19,940 protein coding genes
+```
+
+```{r}
+AML.quantiles <- TPM.long %>% 
+  dplyr::filter(!grepl("BM[0-9]|RO[0-9]|R0[0-9]", Sample)) %>% 
+  group_by(gene_name) %>% 
+  summarise(Median=round(median(TPM), digits=5),
+            Percentile_75th=round(quantile(TPM)[4], digits=5)) %>% 
+  ungroup() %>% 
+  mutate(Median_less_than_5TPM=Median < 5.0,
+         Percentile_less_than_5TPM=Percentile_75th < 5.0)
+
+options(scipen = 999)
+AML.quantiles
+```
+
+The point, using a 5TPM threshold is a strongly expressed gene, far above the noise of RNAseq in general, and patients expression >= 5TPM are most often in the 75th percentile of all expressors for that gene.
+
+```{r}
+ngenes <- length(unique(TPM.long$gene_name))
+                 
+(table(AML.quantiles$Percentile_less_than_5TPM)/ngenes)*100
+
+(table(AML.quantiles$Median_less_than_5TPM)/ngenes)*100
+```
+
+Patients with 5TPM expression would be in the highest 75th percentile of all expressors for 40% of all protein coding genes. 
+
+```{r}
+# GOI <- c("CLECL1", "CLEC2A", "CSPG4", "CRLF2", "CD70", "LAMP5", "CCL23", "SCUBE1", "LTK", "ARTN", "COL23A1", "SPAG6", "MSLN")
+GOI <- c("CRLF2","FOLR1")
+geneIDs_forOncop <- as.data.frame(geneID.map.anno) %>% 
+  dplyr::filter(gene_name %in% GOI) %>% 
+  set_rownames(.$gene_name) 
+```
+
+```{r}
+GOI.summary <- AML.quantiles %>% 
+  dplyr::filter(gene_name %in% geneIDs_forOncop$gene_name) %>% 
+  mutate(gene_name=str_split_fixed(gene_name, pattern="_",n=3)[,1]) %>%
+
+  #remove the duplicates for the PAR regions
+  group_by(gene_name) %>%
+  mutate(Median=sum(Median),
+         Percentile_75th=sum(Percentile_75th)) %>%
+  ungroup() %>%
+  dplyr::filter(!duplicated(gene_name)) %>%
+  mutate(Median_less_than_5TPM=Median < 5.0,
+         Percentile_less_than_5TPM=Percentile_75th < 5.0)
+
+  
+GOI.summary
+```
+
+```{r}
+  table(GOI.summary$Median_less_than_5TPM)
+table(GOI.summary$Percentile_less_than_5TPM)
+```
+
+```{r}
+nbm <- TPM.long %>% 
+  dplyr::filter(grepl("BM[0-9]|RO[0-9]|R0[0-9]", Sample), grepl("ENSG00000205755|ENSG00000110195", gene_name)) %>% 
+  mutate(gene_name=str_split_fixed(gene_name, pattern="_",n=3)[,1]) %>%
+
+  #remove the duplicates for the PAR regions
+  group_by(gene_name,Sample) %>%
+  mutate(TPM=sum(TPM)) %>%
+  dplyr::filter(!duplicated(gene_name)) %>%
+  ungroup()
+ 
+  
+
+nbm
+```
+
+## Density Minimum in Bimodal Distribution
+
+https://stackoverflow.com/questions/25264461/find-local-minimum-in-bimodal-distribution-with-r
+
+```{r fig.height=5, fig.width=5}
+data <- log2(TPM.long$TPM +1)
+d <- density(data)
+hist(data, breaks=seq(min(data), max(data)+1, by=0.5))
+abline(v = 3.5)
+```
+
+```{r fig.height=5, fig.width=5}
+#interploation function
+minima <- optimize(approxfun(d$x,d$y),interval=c(0,3.5))$minimum
+#histogram with density plot
+hist(data, prob=TRUE, breaks=seq(min(data), max(data)+1, by=0.5))
+lines(d, col="red", lty=2)
+abline(v = minima,col="blue")
+```
+
+```{r}
+#So the cut-point for a expression could be 2.3 TPM instead, based empirically on the RNA-seq gene expression distribution. 
+(2^(minima))-1
+```
+
+
+
+## Guassian Mixed Model For TPM cut-off
+
+https://stats.stackexchange.com/questions/57993/how-to-explain-how-i-divided-a-bimodal-distribution-based-on-kernel-density-esti
+
+```{r}
+library("mixtools")
+
+set.seed(2020)
+data <- log2(TPM.long$TPM +1)
+
+#This is the standard EM algorithm for normal mixtures that maximizes the conditional expected complete-data log-likelihood at each M-step of the algorithm
+mixmdl <- normalmixEM(data, k = 2, maxit=100,verb=TRUE,
+                      fast=TRUE,arbmean=TRUE)
+
+
+
+res <- data.frame(x = mixmdl$x)
+```
+
+```{r}
+mixmdl$lambda #	The final mixing proportions.
+mixmdl$mu #The final mean parameters.
+mixmdl$sigma #The final standard deviations.
+```
+
+```{r}
+post.df <- as.data.frame(cbind(x = mixmdl$x, mixmdl$posterior)) %>%
+    mutate(GMM_Group=ifelse(comp.2 >= 0.95, "High", "Low")) %>%
+  bind_cols(., HLA.collapsed.expn)
+
+head(post.df, 10)  # Retrieve first 10 rows
+# tail(post.df, 10)
+# View(post.df)
+```
+
+```{r}
+table(post.df$GMM_Group, post.df$PRAME_Expn_Median)
+```
+
+
+```{r}
+#https://tinyheero.github.io/2015/10/13/mixture-model.html
+plot_mix_comps <- function(x, mu, sigma, lam) {
+  lam * dnorm(x, mu, sigma)
+}
+
+ggplot(data=res) +
+  geom_histogram(aes(x, ..density..),
+                 binwidth = 0.1, colour = "black",
+                 fill = "white") +
+  stat_function(geom = "line", fun = plot_mix_comps,
+                args = list(mixmdl$mu[1], mixmdl$sigma[1], lam = mixmdl$lambda[1]),
+                colour = "red", lwd = 1.5) +
+  stat_function(geom = "line", fun = plot_mix_comps,
+                args = list(mixmdl$mu[2], mixmdl$sigma[2], lam = mixmdl$lambda[2]),
+                colour = "blue", lwd = 1.5) +
+  labs(y="Density",x="log2 PRAME TPM")
+```
+
+
+
+
+
+
+
+
+# Genomic Regions and Gene Aliases
+
+```{r}
+missing_alias <- alias %>%
+  mutate(in_symbol=symbol %in% missing$gene_name, 
+         in_nomenclature=symbol_from_nomenclature_authority %in% missing$gene_name, 
+         in_synonyms=synonyms %in% missing$gene_name) %>% 
+  dplyr::filter(in_symbol | in_nomenclature | in_synonyms) %>%
+  arrange(symbol) %>% 
+  group_by(symbol) %>%
+  mutate(matched_pAML=case_when(
+    in_symbol ~ symbol,
+    in_nomenclature ~ symbol_from_nomenclature_authority,
+    in_synonyms ~ synonyms,
+    TRUE ~ "Remove")) %>%
+  ungroup()
+
+# missing_alias
+# length(unique(missing_alias$symbol)) #64 recovered, ugh. its frankly got more margin of error than just finding genes that map to the same locations. 
+# table(missing_alias$matched_pAML %in% gtex_idmap$gene) #but NONE are in the gtex ids either...
+```
+
+```{r message=FALSE, warning=FALSE}
+gtf_file <- file.path(dirname(TARGET),"Reference_Data/GRCh38/gtf/gencode.v29.annotation.gtf")
+out <- file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/SQL/GRCh38_gencode_v29_TxDB.sqlite")
+
+GRCh38_DB <- AnnotationDbi::loadDb(out)
+# GRCh38_DB <- makeTxDbFromGFF(file=gtf_file,
+#                              format="gtf",
+#                              organism="Homo sapiens",
+#                              dataSource="GRCh38")
+# GRCh38_DB
+# AnnotationDbi::saveDb(GRCh38_DB, out)
+
+gencode_v23 <- GRanges(seqnames = S4Vectors::Rle(gtex_idmap$chrom),
+                       ranges=IRanges::IRanges(start=gtex_idmap$chromStart, end = gtex_idmap$chromEnd),
+                       strand=S4Vectors::Rle(gtex_idmap$strand))
+
+gencode_v23$gene_name <- gtex_idmap$gene
+gencode_v23$gene_id <- gtex_idmap$ensembl_ID
+
+# head(gencode_v23)
+
+ref_genes <- genes(GRCh38_DB)
+names(ref_genes) <- gsub("\\.[0-9]{1,2}","", names(ref_genes))
+ref_genes$gene_id <- gsub("\\.[0-9]{1,2}","", names(ref_genes))
+
+
+missing_gr <- ref_genes[missing$gene_id]
+missing_gr$gene_name <- missing$gene_name
+
+overlaps <- findOverlaps(gencode_v23, missing_gr, 
+                                      type="start",
+                                      select="first") #22 hits with equal, 44 with start, 64 with the aliases, 153 with any overlap 
+
+keep_by_overlap <- data.frame(gtex_index=1:length(overlaps),
+                   pAML_index=overlaps) %>% 
+  dplyr::filter(!is.na(pAML_index)) %>% 
+  dplyr::filter(!duplicated(pAML_index))
+
+length(unique(keep_by_overlap$pAML_index)) #153 have overlapping ranges
+
+# missing_gr[order(missing_gr)]
+# found_by_intersection[order(found_by_intersection)]
+
+merged_by_loc <- as.data.frame(gencode_v23[keep_by_overlap$gtex_index]) %>% 
+  bind_cols(as.data.frame(missing_gr[keep_by_overlap$pAML_index]) %>% 
+              rename_all(~paste0(.,"_pAML"))) %>% 
+  mutate(percent_overlap=round((width/width_pAML)*100, digits = 2)) %>% 
+  dplyr::select(matches("gene_name|gene_id"), percent_overlap, everything()) %>% 
+  arrange(percent_overlap)
+
+# merged_by_loc
+```
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

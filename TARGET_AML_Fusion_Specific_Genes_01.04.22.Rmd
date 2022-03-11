@@ -1,0 +1,667 @@
+---
+title: "Genes Highly Expressed in AML"
+author: "Jenny Smith, Ben Huang"
+date: "Jan 4, 2022"
+output: html_document
+---
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, 
+                      fig.align='center', fig.height = 10,
+                      fig.width = 10)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'/2018.02.12_AML_Specific_Transcripts/'))
+options(stringsAsFactors=FALSE,  java.parameters = "-Xmx4g",
+        bitmapType = 'cairo',device='x11' )
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+library(REDCapR, lib.loc="/home/jlsmith3/R/x86_64-pc-linux-gnu-library/4.0")
+# library(keyring) #set-up the CDE API
+
+getwd()
+```
+
+
+# Define Functions
+
+```{r}
+norm_dist <- function(gene_expn, package="MASS"){
+  
+  if(package == "fitdistrplus"){
+    library(fitdistrplus)
+    FIT <- fitdistrplus::fitdist(gene_expn, "norm")    ## note: it is "norm" not "normal"
+    return(FIT)
+  }else if(package == "MASS"){
+    library(MASS)
+    fit <- fitdistr(gene_expn,densfun =  "normal")
+    para <- fit$estimate
+    # hist(geneA_NBM, prob = TRUE)
+    # curve(dnorm(x, para[1], para[2]), col = 2, add = TRUE)
+    return(para)
+  }
+}
+```
+
+```{r}
+calc_wilcox_test <- function(data, fusion_of_interest){
+  
+  cols <- paste0(gsub("-",".", fusion_of_interest),
+                 "_vsNBM_", 
+                 c("p.value","log2_FC"))
+  
+  res <- data %>% 
+    filter(Primary.Fusion==fusion_of_interest | Primary.Fusion=="NBM") %>% 
+    
+    group_by(gene_name,Primary.Fusion) %>%
+    mutate(mean_TPM=mean(TPM)) %>%
+    ungroup() %>%
+    
+    group_by(gene_name) %>%
+    summarize(!!cols[1] := format(wilcox.test(TPM ~ Primary.Fusion, paired=FALSE)$p.value,
+                                           digits = 3),
+              !!cols[2] := round(log2(unique(mean_TPM[Primary.Fusion!="NBM"])) - log2(unique(mean_TPM[Primary.Fusion=="NBM"])),
+                                                   digits = 2)) %>%
+    ungroup() 
+  
+  return(res)
+}
+```
+
+
+# Raw Counts
+
+```{r}
+genome <- "GRCh38" #or GRCh37
+```
+
+
+## GRCh38 
+
+
+```{r}
+current_files <- dir(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/"))
+# current_files
+    
+#In this case, use the exact same TPMs as provided to Ben Huang!
+if(genome=="GRCh38"){
+    grch38_cts_file <- grep("_RBD_.+scaledTPM_counts.RDS", current_files, value=TRUE)
+    cts_grch38 <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/",grch38_cts_file))
+    cts_grch38_ids <- cts_grch38[,grep("gene_id|gene_name", colnames(cts_grch38))]
+    
+    cts_grch38 <- as.data.frame(cts_grch38)
+    rownames(cts_grch38) <-  cts_grch38_ids$gene_name
+    cts_grch38 <- cts_grch38[,-grep("gene_id|gene_name", colnames(cts_grch38))]
+    
+    # head(cts_grch38[,1:5])
+    dim(cts_grch38) #58263  3021 
+    
+    ### TPM
+    grch38_TPM_file <- grep("Gencode.v29_protein-coding_geneLevel_TPM.txt", dir("Expression_Data/"), value=TRUE)
+    TPM_grch38 <- read.delim(file.path("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM.txt"), 
+                             sep="\t")
+    
+    # head(TPM_grch38)
+    dim(TPM_grch38) #58263  3021
+}
+```
+
+
+### Additional Expression Data
+
+```{r eval=FALSE}
+# transcript.TPM.full <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/transcript_level/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_TranscriptLevel_Abundance_TPM.RDS"))
+# colnames(transcript.TPM.full)[grep("PATGIG|PATISD", colnames(transcript.TPM.full))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(transcript.TPM.full), value=T))
+
+# dim(transcript.TPM.full)
+# head(transcript.TPM.full[,1:5])
+```
+
+```{r eval=FALSE}
+gtex.TPM.full <- readRDS("Expression_Data/TOIL_TARGET_TGCA_GTEX__rsem_gene_tpm.RDS")
+
+
+head(gtex.TPM.full[,1:5])
+dim(gtex.TPM.full) #60498 19260
+```
+
+
+# ClinData
+
+```{r message=FALSE}
+#https://cran.r-project.org/web/packages/REDCapR/vignettes/workflow-read.html
+project <- "AML_restricted_Genes_2022"
+
+if(project==""){
+  stop("Must include Projecy name!")
+}else{
+  message(paste0("Project is: ",project))
+  current_cde_database <- paste("TARGET_AML_CDEs_For_Project",project, ".RDS", sep="_")
+
+  if(file.exists(current_cde_database)){
+    print("Reading CDEs from Rdata object.")
+    merged <- readRDS(current_cde_database)
+
+  }else{
+    print("Downloading CDEs from RedCap API.")
+    path_credential <- file.path(HOME,".redcap")
+    project_id <- 1295
+
+    credential  <- REDCapR::retrieve_credential_local(
+      path_credential = path_credential,
+      project_id = project_id)
+
+    #takes about 30 sec to download.
+    merged <- redcap_read(redcap_uri = credential$redcap_uri,
+                          token = credential$token,
+                          raw_or_label_headers = 'label')
+    if(merged$success){
+      merged <- data.frame(merged$data, check.names=TRUE) #remove the white spaces  (will this even work??)
+      saveRDS(merged, current_cde_database)
+    }
+
+    #Create a simple log file from the day the project starts
+    cat(c(paste("Date:", Sys.Date()),
+          paste("cts:", basename(get(ls(pattern = "_cts_file")))),
+          paste("tpm:", basename(get(ls(pattern = "_TPM_file")))),
+          paste("CDE:", current_cde_database)),
+          sep = "\n",
+          file = paste(project, Sys.Date(), ".log", sep="_"))
+
+  }
+
+  #keep a list of the ineligable patiens to remove if necessary
+  inelig <- merged %>%
+    filter(Eligibility.Comments == "remove") %>%
+    pull(USI)
+
+  #Filter those with USIs and are eligible for the study
+  merged <- merged %>%
+    filter(Eligibility.Comments != "remove")
+
+
+  dim(merged)
+  head(merged)
+
+}
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(sample_info)
+```
+
+```{r}
+rnaseq_fastqs <- read.csv(file.path(TARGET,"SequencingDataMatrix/Fastq_manifests/TARGET_AML_RNAseq_Fastq_File_Manifest_shareable_08.11.21.csv"))
+
+dim(rnaseq_fastqs)
+# head(rnaseq_fastqs)
+# table(rnaseq_fastqs$Group)
+```
+
+
+
+# Read in the Annotations 
+
+```{r}
+geneID.map.anno <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt")) %>%  
+  filter(gene_name %in% rownames(TPM_grch38)) %>%
+  
+  # Deduplication 
+  filter(!grepl("_PAR_Y", gene_id)) %>% 
+  group_by(gene_name) %>% 
+  mutate(Keep=case_when(
+    n() >= 2 & !all(is.na(Ensembl_ProteinID_with_MembraneLocalization)) ~ !is.na(Ensembl_ProteinID_with_MembraneLocalization),
+    n() >= 2 & !all(gene_type=="protein_coding") ~ gene_type=="protein_coding", 
+    n() >= 2 ~  gene_id %in% cts_grch38_ids$gene_id, 
+    n() == 1 ~ TRUE)) %>% 
+  ungroup() %>%
+  filter(Keep) %>% 
+  
+  # examine cell adhesion labels for accuracy 
+  mutate(misannotation=case_when(
+    Cell_Adhesion_Gene=="Yes" & Cell_Surface_Protein=="Yes" ~ "OK", #will need to check these as they are primarily HPA antibody staining evidence with 1 ab (weak evidence)
+    Cell_Adhesion_Gene=="Yes" & grepl("Transcription|Transcription regulation", Uniprot_Keywords) ~ "Yes",
+    Cell_Adhesion_Gene=="Yes" & grepl("MIR[0-9]|MIRLET[0-9]", gene_name) ~ "Yes",
+    Cell_Adhesion_Gene=="Yes" & is.na(Cellular.Compartment_Membrane) &
+      !c(grepl("Cell adhesion|Secreted|Signal|Cell junction", Uniprot_Keywords) |
+           grepl("Cell Junctions", Additional.location_HumanProteinAtlas)) ~ "ambiguous",
+    Cell_Adhesion_Gene=="Yes" & !is.na(Cellular.Compartment_Membrane) ~ "OK",
+    TRUE ~ "OK")) %>%
+  mutate_at(vars(Cell_Adhesion_Gene), ~case_when(
+    misannotation == "Yes" ~ "",
+    TRUE ~ .)) %>%
+  mutate_at(vars(Cell_Surface_Protein), ~case_when(
+    gene_name=="PRAME" ~ "",
+    TRUE ~ .)) %>%
+  select(-misannotation)
+
+
+head(geneID.map.anno[,1:5])
+dim(geneID.map.anno) #19901    24
+table(geneID.map.anno$gene_type)
+```  
+
+```{r}
+AML.genes <- read.delim("ALL_GENES.output.candidate_genes_cohorts.1stdev_filter.tsv", header=FALSE) %>% 
+  set_names(c("gene_name","enriched_subtypes"))
+
+
+# head(AML.genes)
+dim(AML.genes) #3864    2
+```
+
+# Define Samples 
+
+```{r}
+samples_to_select <- read.csv("Expression_Data/TARGET_AML_Input_Samples_for_AMLRestrictedGenes_Analysis_6.22.21.csv") %>% 
+  filter(!USI %in% inelig) %>% 
+  filter(!grepl("replicate", Sample))
+
+dim(samples_to_select)
+table(samples_to_select$Group)
+table(samples_to_select$AML_Subtype)
+```
+
+
+# Subset Counts 
+
+```{r}
+samps <- intersect(colnames(TPM_grch38), samples_to_select$Sample) #missing Stella
+gene.RBD <- TPM_grch38[,samps]
+
+
+head(gene.RBD[,1:5])
+dim(gene.RBD) #19901  1565
+```
+
+```{r}
+# Gather TPM values into Long Format
+TPM.long <- readRDS("Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+
+# TPM.long <- gene.RBD %>% 
+#   as.data.frame() %>% 
+#   rownames_to_column("gene_name") %>% 
+#   gather(Sample, TPM, -gene_name,) %>%
+#   left_join(., samples_to_select, by="Sample") %>%
+#   mutate(AML_Subtype_Simple=case_when(
+#     n() >= 10 ~ Primary.Fusion,
+#     TRUE ~ "OtherAML")) %>%
+#   ungroup() %>%
+#   mutate(AMLvsNormals=ifelse(grepl("CD34_PB|NBM", Group), "Normal", "AML"))
+# 
+# 
+# head(TPM.long)
+dim(TPM.long)
+
+# any(is.na(TPM.long$gene_name))
+# saveRDS(TPM.long, "Expression_Data/TARGET_AML_Kallisto_GRCh38_Gencode.v29_protein-coding_geneLevel_TPM_longFormat.RDS")
+```
+
+```{r}
+# table(samples_to_select$AML_Subtype)
+```
+
+
+# Examine Two Initial Methods
+
+Comparison of Ben's initial ratio analysis and the 5TPM hard-threshold analysis 
+
+Table 1. Hard threshold Filtering Strategy
+1. Gene < 5.0 TPM in 90% of CD34+ Peripheral bloods 
+  a. AND max TPM < 7.5 TPM (1.5x greater than 5)
+2. Gene < 5.0 TPM in 90% of CD34+ Peripheral bloods
+  a. AND Gene < 5.0 TPM in in 90% of bulk normal marrows 
+  b. AND max TPM < 7.5 TPM for both
+3. Gene >= 5.0 TPM diagnostic AML
+  a. with at least 1 of 20 AML subtypes expressing it at  >=  5TPM for 30% of samples in that subtype.
+
+*NOTE*
+Oof GOLGA8M is either protein coding OR a lncRNA. Currently the de-duplicated TPM data uses the lncRNA gene_id. ugh - need to address this. 
+
+```{r}
+hard_threshold <- openxlsx::read.xlsx("Results/5TPM_Cutoff_Only/TARGET_AML_Restricted_Genes_5TPM_Threshold_all_genes.xlsx",sheet="AML_Restricted_Genes")
+
+hard_threshold <- hard_threshold %>% 
+  select(gene_name_orig=gene_name, everything(), -matches("^Column[0-9]")) %>% 
+  left_join(., select(geneID.map.anno, gene_name, gene_id),
+            by="gene_id") %>% 
+  select(gene_name, everything())
+
+dim(hard_threshold)
+# head(hard_threshold)
+
+# filter(hard_threshold, is.na(gene_name))
+# filter(geneID.map.anno,  grepl("ENSG00000188626", gene_id))
+# filter(geneID.map.anno,  grepl("GOLGA8M", gene_name))
+```
+
+```{r}
+# length(unique(hard_threshold$gene_name)) #704 total genes with some level of expression
+table(hard_threshold$TransMembrane_Or_Intracellular)
+# Cell_Membrane Intracellular 
+#           381           323
+grep("FOLR1|MSLN|CLEC2A|NCAM1", hard_threshold$gene_name, value=TRUE) #missing NCAM1
+grep("FOLR1|MSLN|CLEC2A|NCAM1", AML.genes$gene_name, value=TRUE)
+```
+
+```{r fig.height=6, fig.width=12}
+gene_by_fusion <- hard_threshold %>%
+  select(gene_name, TransMembrane_Or_Intracellular,matches("Percent_Expressors_GT.5TPM"), matches("Max")) %>% 
+  pivot_longer(matches("Percent_Expressors_GT.5TPM"), names_to="group", values_to="Percent_Expressors_GT.5TPM") %>% 
+  separate(group, into=c("fusion","N", "threshold"), sep="_",extra="merge") 
+
+# gene_by_fusion %>%
+#   group_by(fusion, N) %>% 
+#   filter(Percent_Expressors_GT.5TPM >= 30) %>% 
+#   dplyr::count() %>% 
+#   ungroup() %>% 
+#   arrange(desc(n)) #with at least 
+
+byLoc <- gene_by_fusion %>%
+  group_by(fusion,TransMembrane_Or_Intracellular, N) %>% 
+  filter(Percent_Expressors_GT.5TPM >= 30) %>% 
+  dplyr::count() %>% 
+  ungroup() %>% 
+  group_by(fusion) %>% 
+  mutate(Total=sum(n)) %>% 
+  ungroup() %>% 
+  arrange(Total) %>%  #with at least 
+  mutate(fusion=factor(fusion, levels=unique(fusion)))
+
+
+
+ggplot(byLoc, aes(x=fusion, y=n, fill=TransMembrane_Or_Intracellular)) +
+  geom_col(position = position_dodge(), alpha=0.6) +
+  scale_y_continuous(breaks=seq(0,200, by=10)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 25, vjust=1, hjust=1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.margin = margin(l=5))
+
+# length(unique(gene_by_fusion$gene_name))
+```
+
+```{r}
+table(hard_threshold$gene_name %in% AML.genes$gene_name) #154 are not in the AML genes by log ratio 
+#of the 154, only 40 have a fold-change >= 2.0x, so that could be causing an issue. OR 
+table(AML.genes$gene_name %in% hard_threshold$gene_name) #3314 are not in the hard thresholds - due to low expression likely? 
+```
+
+```{r}
+genes_in_ratio <- setdiff( AML.genes$gene_name, hard_threshold$gene_name)
+in_ratio <- TPM.long %>% 
+  filter(gene_name %in% genes_in_ratio) %>% 
+  mutate_at(vars(AML_Subtype), ~case_when(
+    grepl("NBM|CD34", .) ~ "Normals",
+    TRUE ~ .
+  )) %>% 
+  group_by(gene_name, AML_Subtype) %>% 
+  summarize(mean=mean(TPM), 
+            Q3=quantile(TPM, probs=0.75)) %>% 
+  ungroup() %>% 
+  mutate_if(is.numeric, round, digits=3) 
+
+# options(scipen = )
+
+# dim(in_ratio)
+in_ratio_high <- in_ratio %>% 
+  group_by(gene_name) %>%  
+  mutate(High_in_NBM=ifelse(any(AML_Subtype=="Normals" & Q3>=7.5),"Yes", "No")) %>% 
+  filter(any(Q3 >= 5.0)) %>% 
+  ungroup()
+
+in_ratio_Low <- in_ratio %>% 
+  group_by(gene_name) %>% 
+  mutate(LessThan1TPM=ifelse(all(Q3 < 1.0), "Yes", "No")) %>% 
+  filter(all(Q3 < 5.0)) %>% 
+  ungroup()
+
+length(unique(in_ratio_high$gene_name)) #1,558 are more highly expressed in the normal marrows 
+length(unique(in_ratio_Low$gene_name)) # 1,756 have Q3 < 5.0, so less than 25% have any higher expression, further 1,189 have Q3 less than 1 TPM
+
+
+in_ratio_Low %>% 
+  filter(LessThan1TPM =="Yes") %>% 
+  pull(gene_name) %>% 
+  unique() %>% 
+  length()
+
+table(in_ratio_Low$LessThan1TPM)
+range(in_ratio_Low$Q3)
+# range(in_ratio$Q3)
+```
+
+```{r}
+genes <- setdiff(hard_threshold$gene_name, AML.genes$gene_name)
+subset <- TPM.long %>% 
+  filter(gene_name %in% genes) %>% 
+  mutate_at(vars(AML_Subtype), ~case_when(
+    grepl("NBM|CD34", .) ~ "Normals",
+    TRUE ~ .
+  )) %>% 
+  group_by(gene_name, AML_Subtype) %>% 
+  summarize(mean=mean(TPM), 
+            max=max(TPM), 
+            Q3=quantile(TPM, probs = 0.75)) %>% 
+  pivot_wider(id_cols=c(gene_name),
+              names_from=AML_Subtype, 
+              values_from=c(mean),
+              names_glue="{AML_Subtype}_mean_TPM") %>% 
+  pivot_longer(cols = -matches("Normals|gene_name|Q3"),
+               names_to="Fusion", 
+               values_to="mean_TPM") %>% 
+  mutate(log2_FC=log2(mean_TPM)-log2(Normals_mean_TPM)) %>%
+  mutate_if(is.numeric, ~round(., digits=2)) %>%
+  arrange(desc(log2_FC), .by_group=TRUE) %>%
+  ungroup()
+
+subset
+# table(subset$AML_Subtype)
+
+# subset %>%
+#   group_by(gene_name) %>%
+#   dplyr::slice(1) %>%
+#   arrange(desc(log2_FC)) %>%
+#   filter(log2_FC >=1)
+
+
+# write.table(genes,"~/TARGET_AML_restricted_genes_absent_from_log_ratio_analysis_01.25.2022.csv", row.names = FALSE, col.names = FALSE, quote=FALSE, sep=",")
+
+
+
+```
+
+```{r}
+genes
+```
+
+
+
+# Fusion of Interest: Expressed Genes 
+
+```{r}
+groups <- unique(TPM.long$Primary.Fusion)
+groups <- groups[-grep("NBM|CD34", groups)]
+# groups
+
+
+sig_expression <- purrr::map_dfc(groups, calc_wilcox_test, data=TPM.long) %>% 
+  select(gene_name=1, matches("p.value|log2"))
+
+head(sig_expression)
+dim(sig_expression) # 3864    
+```
+
+```{r}
+expression_stats <- TPM.long %>% 
+  group_by(gene_name,Primary.Fusion) %>% 
+  summarize(min=min(TPM),
+            Q1=quantile(TPM, probs = c(0.25)),
+            median=median(TPM),
+            Q3=quantile(TPM, probs=c(0.75)),
+            perc90th=quantile(TPM, probs = c(0.90)),
+            mean=mean(TPM),
+            max=max(TPM),
+            percent_expressors=round((sum(TPM >= 1.0)/n())*100, digits = 2)) %>%
+  mutate(range=max-min) %>%
+  ungroup()  %>% 
+  
+  #Round and clean up the values
+  mutate(across(c(min:range), ~round(., digits = 3))) %>% 
+  mutate_at(vars(Primary.Fusion), ~gsub("-", ".", .))  %>% 
+  rename_at(vars(min:range), ~paste0(., "_TPM")) %>% 
+  
+  #Make into wide format
+  pivot_wider(id_cols = gene_name,
+              names_from=Primary.Fusion,
+              values_from=c(min_TPM:range_TPM),
+              names_glue="{Primary.Fusion}_{.value}") %>% 
+  left_join(., sig_expression, by="gene_name")  %>% 
+  
+  #order the columns by fusion/normal class
+  select(colnames(.)[order(colnames(.))]) %>% 
+  select(gene_name, matches("^NBM"), matches("^CD34"), everything()) 
+
+
+head(expression_stats)
+# dim(expression_stats)
+```
+
+
+```{r}
+expression_stats_clean <-   geneID.map.anno %>% 
+  select(gene_id, gene_name,
+         Cell_Surface_Protein,Cell_Adhesion_Gene, 
+         Transmembrane_Helix,CancerTestesAntigen_CTA) %>% 
+  inner_join(., expression_stats, by="gene_name")
+  
+  
+# expression_stats_clean
+```
+
+```{r}
+FUS.ERG <- expression_stats_clean %>% 
+  select(gene_id:CancerTestesAntigen_CTA,
+         matches("FUS.ERG"),
+         matches("^NBM"), 
+         matches("^CD34")) %>% 
+  filter(FUS.ERG_Q3_TPM >= 5.0, 
+         CD34_PB_Q3_TPM < 1.0, 
+         NBM_Q3_TPM < 1.0) %>% 
+  arrange(desc(Cell_Surface_Protein), desc(FUS.ERG_percent_expressors_TPM)) 
+  
+
+dim(FUS.ERG) #27 35
+table(FUS.ERG$Cell_Adhesion_Gene)
+table(FUS.ERG$Cell_Surface_Protein) #12
+
+
+# write.csv(FUS.ERG, "TARGET_AML_Restricted_Genes_in_FUS-ERG_10.28.2021.csv", row.names = FALSE)
+```
+
+```{r}
+NUP98.NSD1 <- expression_stats_clean %>% 
+  select(gene_id:CancerTestesAntigen_CTA,
+         matches("NUP98.NSD1"),
+         matches("^NBM"), 
+         matches("^CD34")) %>% 
+  filter(NUP98.NSD1_Q3_TPM >= 5.0, 
+         CD34_PB_Q3_TPM < 1.0, 
+         NBM_Q3_TPM < 1.0) %>% 
+  arrange(desc(Cell_Surface_Protein),
+          desc(NUP98.NSD1_percent_expressors_TPM)) 
+  
+
+
+dim(NUP98.NSD1)
+table(NUP98.NSD1$Cell_Adhesion_Gene)
+table(NUP98.NSD1$Cell_Surface_Protein) 
+
+# write.csv(NUP98.NSD1, "TARGET_AML_Restricted_Genes_in_NUP98-NSD1_10.28.2021.csv", row.names = FALSE)
+```
+
+
+```{r}
+NUP98.KDM5A <- expression_stats_clean %>% 
+  select(gene_id:CancerTestesAntigen_CTA,
+         matches("NUP98.KDM5A"),
+         matches("^NBM"), 
+         matches("^CD34")) %>% 
+  filter(NUP98.KDM5A_Q3_TPM >= 5.0, 
+         CD34_PB_Q3_TPM < 1.0, 
+         NBM_Q3_TPM < 1.0) %>% 
+  arrange(desc(Cell_Surface_Protein), 
+          desc(NUP98.KDM5A_percent_expressors_TPM)) 
+  
+
+
+dim(NUP98.KDM5A)
+table(NUP98.KDM5A$Cell_Adhesion_Gene)
+table(NUP98.KDM5A$Cell_Surface_Protein) 
+
+ # write.csv(NUP98.KDM5A, "TARGET_AML_Restricted_Genes_in_NUP98-KDM5A_10.28.2021.csv", row.names = FALSE)
+```
+
+# Data Visualization 
+
+```{r}
+z.scores <- common_expn_subset %>% 
+  filter(!grepl("CD34_PB", ETS_Fusion_Groups)) %>% 
+  group_by(gene_name) %>% 
+  mutate(z_score=(log2CPM-mean(log2CPM))/sd(log2CPM)) %>% 
+  ungroup() %>% 
+  select(gene_name:log2CPM, z_score, everything()) %>% 
+  
+  group_by(ETS_Fusion_Groups, gene_name) %>% 
+  summarise(Mean_Z_Score=mean(z_score)) %>% 
+  ungroup()
+```
+
+
+# Normal Blood Expression
+
+4	RNA consensus tissue gene data
+Consensus transcript expression levels summarized per gene in 62 tissues based on transcriptomics data from three sources: HPA, GTEx and FANTOM5. The consensus normalized expression ("NX") value is calculated as the maximum NX value for each gene in the three data sources. For tissues with multiple sub-tissues (brain regions, blood cells, lymphoid tissues and intestine) the maximum of all sub-tissues is used for the tissue type. The tab-separated file includes Ensembl gene identifier ("Gene"), analysed sample ("Tissue") and normalized expression ("NX"). The data is based on The Human Protein Atlas version 20.1 and Ensembl version 92.38.
+
+RNA HPA blood cell gene data
+Transcript expression levels summarized per gene in 18 blood cell types and total PBMC. The tab-separated file includes Ensembl gene identifier ("Gene"), analysed sample ("Blood cell"), transcripts per million ("TPM"), protein-coding transcripts per million ("pTPM") and normalized expression ("NX"). The data is based on The Human Protein Atlas version 20.1 and Ensembl version 92.38.
+
+# Normal Tissue Expression
+
+brain, heart, lung, IMPORTANT 
+Find like the top 20 tissues that are most important! 
+
+GTEX gold-standard 
+
+https://cran.r-project.org/web/packages/ClusterR/vignettes/the_clusterR_package.html
+https://towardsdatascience.com/mixture-modelling-from-scratch-in-r-5ab7bfc83eef 
+https://www.stat.cmu.edu/~cshalizi/uADA/12/lectures/ch20.pdf 
+https://academic.oup.com/bioinformatics/advance-article/doi/10.1093/bioinformatics/btab869/6493225?login=true#.YdSc02Jm_hM.linkedin 
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+
